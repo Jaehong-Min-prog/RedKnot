@@ -661,6 +661,9 @@ class ServerArgs:
     # varlen path instead of dense SDPA. See layers/attention/redknot/segpaged.py.
     redknot_segpaged_decode: bool = False
     redknot_page_size: int = 64
+    # Experimental native Scheduler lifecycle for managed head pages. This is
+    # live Qwen3 MHA/GQA only; non-prefix document import is not exposed yet.
+    redknot_managed_kv: bool = False
 
     # SegPagedAttention standalone backend — see
     # sglang/srt/layers/attention/segpaged_backend.py. These mirror the
@@ -979,6 +982,11 @@ class ServerArgs:
         # Validate the RedKnot progressive top-K schedule early: a typo must not
         # survive to a run that silently measures the dense baseline.
         self._handle_redknot_progressive_topk()
+
+        if self.redknot_managed_kv:
+            from sglang.srt.mem_cache.head_kv.production import validate_managed_server_args
+
+            validate_managed_server_args(self)
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -5798,6 +5806,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.redknot_page_size,
             help="SegPagedAttention page size (tokens per page) for decode.",
+        )
+        parser.add_argument(
+            "--redknot-managed-kv",
+            action="store_true",
+            default=ServerArgs.redknot_managed_kv,
+            help=(
+                "Experimental native Scheduler managed-head-KV lifecycle for "
+                "single-GPU Qwen3. Requires redknot backend, page-size=1, "
+                "disabled radix/graphs/overlap. No non-prefix import yet."
+            ),
         )
         # SegPagedAttention standalone backend options.
         parser.add_argument(

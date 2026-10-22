@@ -308,6 +308,7 @@ def _headclass_online_attention(
     seg_offset: int,
     num_q_per_kv: int,
     sm_scale: float,
+    reused_local_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Online-prefill attention with paper head-class sparsity.
 
@@ -366,7 +367,12 @@ def _headclass_online_attention(
     #                last (W+Lb) tokens of [online_prev | self].
     #   (2) sink   : flash_attn(non-causal) over the first ``sink`` tokens.
     # GQA is native (K/V keep Hkv heads). No attn_mask is ever built.
-    if local_kv.numel() > 0:
+    if local_kv.numel() > 0 and reused_local_output is not None:
+        if reused_local_output.shape != out.shape:
+            raise ValueError("reused local attention output has the wrong geometry")
+        qh = _q_heads_for(local_kv)
+        out[:, qh] = reused_local_output[:, qh].to(device)
+    elif local_kv.numel() > 0:
         s = max(0, min(sink_size, L0))
         qh = _q_heads_for(local_kv)
         q_l = q[:, qh]  # [1, n_l_kv * gqa, Lb, D]
@@ -1193,6 +1199,7 @@ def _flat_headclass_attention(
     seg0_len: int,
     num_q_per_kv: int,
     sm_scale: float,
+    reused_local_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single-pass head-class attention over the WHOLE online sequence.
 
@@ -1244,7 +1251,12 @@ def _flat_headclass_attention(
         out[:, qh] = g_out
 
     # ── LOCAL heads: sink + sliding window over [seg0 | online] ──
-    if local_kv.numel() > 0:
+    if local_kv.numel() > 0 and reused_local_output is not None:
+        if reused_local_output.shape != out.shape:
+            raise ValueError("reused local attention output has the wrong geometry")
+        qh = _q_heads_for(local_kv)
+        out[:, qh] = reused_local_output[:, qh].to(device)
+    elif local_kv.numel() > 0:
         s = max(0, min(sink_size, seg0_len))
         qh = _q_heads_for(local_kv)
         q_l = q[:, qh]
@@ -1301,6 +1313,9 @@ def _run_flat_custom(
     sparse_ffn_schedule,
     sparse_ffn_stats,
     use_compile,
+    segment_lengths,
+    fallback_ffn_deltas,
+    fallback_attn_outputs,
 ):
     """Custom single-pass flat forward (no HF model.forward wrapper).
 
@@ -1357,6 +1372,11 @@ def _run_flat_custom(
             seg0_len=seg0_len,
             num_q_per_kv=num_kv_groups,
             sm_scale=attn.scaling,
+            reused_local_output=(
+                fallback_attn_outputs[li]
+                if fallback_attn_outputs is not None
+                else None
+            ),
         )
         importance = (
             token_importance_from_attn(attn_out).detach()
@@ -1385,6 +1405,8 @@ def _run_flat_custom(
                 layer_idx=li,
                 schedule=sparse_ffn_schedule,
                 importance=importance,
+                segment_lengths=(segment_lengths if fallback_ffn_deltas is not None else None),
+                fallback_delta=(fallback_ffn_deltas[li] if fallback_ffn_deltas is not None else None),
                 return_stats=True,
             )
             if sparse_ffn_stats is not None:
@@ -1418,6 +1440,7 @@ def online_forward_segments_flat(
     sparse_ffn_schedule: Optional[SparseFFNSchedule] = None,
     sparse_ffn_stats: Optional[List[dict]] = None,
     use_compile: bool = False,
+    reuse_local_attn_output: bool = False,
 ) -> List[List[Tuple[torch.Tensor, torch.Tensor]]]:
     """Single-pass online prefill: all online segments as ONE sequence.
 
@@ -1489,6 +1512,42 @@ def online_forward_segments_flat(
 
     captured_kv: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * n_layers
     captured_importance: List[Optional[torch.Tensor]] = [None] * n_layers
+    fallback_ffn_deltas: Optional[List[torch.Tensor]] = None
+    fallback_attn_outputs: Optional[List[torch.Tensor]] = None
+    captured_ffn = [getattr(seg, "ffn_delta", None) for seg in segments_offline[1:]]
+    if sparse_ffn_schedule is not None and any(delta is not None for delta in captured_ffn):
+        if any(delta is None for delta in captured_ffn):
+            raise RuntimeError("offline FFN deltas must cover every online document")
+        fallback_ffn_deltas = []
+        for layer_idx in range(n_layers):
+            parts = [
+                seg.ffn_delta[layer_idx].to(device) for seg in segments_offline[1:]
+            ]
+            delta = torch.cat(parts, dim=1)
+            if delta.shape[:2] != (1, T):
+                raise RuntimeError("offline FFN delta geometry differs from online rows")
+            fallback_ffn_deltas.append(delta)
+    if reuse_local_attn_output:
+        if any(getattr(seg, "attn_output", None) is None for seg in segments_offline[1:]):
+            raise RuntimeError(
+                "head-split online forward requires offline attention outputs"
+            )
+        fallback_attn_outputs = []
+        for layer_idx in range(n_layers):
+            parts = [
+                seg.attn_output[layer_idx].to(device)
+                for seg in segments_offline[1:]
+            ]
+            value = torch.cat(parts, dim=1)
+            if value.shape[:2] != (1, T):
+                raise RuntimeError(
+                    "offline attention output geometry differs from online rows"
+                )
+            Hq = config.num_attention_heads
+            D = config.head_dim
+            fallback_attn_outputs.append(
+                value.view(1, T, Hq, D).transpose(1, 2)
+            )
 
     def make_patched_attn(layer_idx: int):
         attn_module = base_model.layers[layer_idx].self_attn
@@ -1532,6 +1591,11 @@ def online_forward_segments_flat(
                 seg0_len=seg0_len,
                 num_q_per_kv=num_kv_groups,
                 sm_scale=attn_module.scaling,
+                reused_local_output=(
+                    fallback_attn_outputs[layer_idx]
+                    if fallback_attn_outputs is not None
+                    else None
+                ),
             )
             if sparse_ffn_schedule is not None:
                 captured_importance[layer_idx] = token_importance_from_attn(
@@ -1573,6 +1637,8 @@ def online_forward_segments_flat(
                 layer_idx=layer_idx,
                 schedule=sched,
                 importance=importance,
+                segment_lengths=(online_lens if fallback_ffn_deltas is not None else None),
+                fallback_delta=(fallback_ffn_deltas[layer_idx] if fallback_ffn_deltas is not None else None),
                 return_stats=True,
             )
             if sparse_ffn_stats is not None:
@@ -1600,6 +1666,9 @@ def online_forward_segments_flat(
             sparse_ffn_schedule=sparse_ffn_schedule,
             sparse_ffn_stats=sparse_ffn_stats,
             use_compile=use_compile,
+            segment_lengths=online_lens,
+            fallback_ffn_deltas=fallback_ffn_deltas,
+            fallback_attn_outputs=fallback_attn_outputs,
         )
     else:
         orig_attn: dict = {}
@@ -2160,6 +2229,12 @@ def run_redknot_offlinekv(
     use_flat: bool = True,
     window_ratio: Optional[float] = None,
     window_min: int = 256,
+    query_backend: str = "native",
+    paged_skip_invisible: bool = True,
+    timing_stats: Optional[dict] = None,
+    decode_first_token_from_headclass: bool = False,
+    query_local_full_scope: bool = False,
+    reuse_local_attn_output: bool = False,
 ) -> Tuple[torch.Tensor, str, int, float]:
     """RedKnot head-class hybrid KV reuse (paper-faithful design).
 
@@ -2194,7 +2269,50 @@ def run_redknot_offlinekv(
     sparsity (only global heads do full-context work) plus Sparse FFN,
     *not* from skipping the online forward — which would corrupt the
     global heads' cross-segment signal.
+
+    ``query_backend="managed_paged"`` opts the query phase into the bounded
+    head-page manager/kernel. It preserves the already-selected local prefix,
+    rather than introducing a second moving-window policy. Prefix admission,
+    suffix writes and manager cleanup are included in online TTFT; the native
+    path remains the default. This bridge does not route the document online
+    forward or native greedy decode through the new manager.
+
+    Returned TTFT ends after the first *emitted* token is materialized by
+    Phase E, including its cache construction and seed forward. Historically
+    this driver stopped at Phase D even though those logits do not drive its
+    output text. ``first_logits`` retains the Phase-D diagnostic convention;
+    ``timing_stats`` distinguishes that earlier checkpoint from emitted TTFT.
+    ``decode_first_token_from_headclass=True`` instead emits the Phase-D first
+    token, while still including the seed forward needed for later decoding.
+
+    ``reuse_local_attn_output`` opts into immutable offline local-head output
+    reuse during the flat document forward. Captured offline FFN deltas opt
+    sparse layers into per-document selection and residual-delta reuse.
+    Existing artifacts without these optional payloads retain their original
+    execution path. ``query_local_full_scope`` lets query local heads read
+    every cached document position, for both native and managed backends.
     """
+    if query_backend not in ("native", "managed_paged"):
+        raise ValueError("query_backend must be 'native' or 'managed_paged'")
+    if not isinstance(paged_skip_invisible, bool):
+        raise TypeError("paged_skip_invisible must be bool")
+    for name, value in (("decode_first_token_from_headclass", decode_first_token_from_headclass),
+                        ("query_local_full_scope", query_local_full_scope),
+                        ("reuse_local_attn_output", reuse_local_attn_output)):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be bool")
+    if reuse_local_attn_output and not use_flat:
+        raise ValueError("offline local attention-output reuse requires use_flat=True")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+    if timing_stats is not None:
+        timing_stats.update(query_backend=query_backend,
+                            paged_skip_invisible=paged_skip_invisible,
+                            decode_first_token_from_headclass=decode_first_token_from_headclass,
+                            query_local_full_scope=query_local_full_scope,
+                            reuse_local_attn_output=reuse_local_attn_output,
+                            manager_update_calls=0, manager_append_many_calls=0,
+                            managed_attention_calls=0)
     if rope_helper is None:
         base_model = model.model if hasattr(model, "model") else model
         rope_helper = RoPEHelper(base_model.rotary_emb)
@@ -2203,6 +2321,11 @@ def run_redknot_offlinekv(
     device = model.device
     base_model = model.model if hasattr(model, "model") else model
     Hkv = head_cfg.num_kv_heads
+    if query_backend == "managed_paged":
+        attn_devices = {next(layer.self_attn.parameters()).device for layer in base_model.layers}
+        attn_dims = {layer.self_attn.head_dim for layer in base_model.layers}
+        if len(attn_devices) != 1 or len(attn_dims) != 1:
+            raise ValueError("managed query backend currently requires single-device uniform MHA/GQA layers")
 
     doc_lens = [seg.doc_len for seg in segments_offline]
     offsets, p = [], 0
@@ -2236,6 +2359,7 @@ def run_redknot_offlinekv(
             sparse_ffn_schedule=sparse_ffn_schedule,
             sparse_ffn_stats=sparse_ffn_stats,
             use_compile=use_compile,
+            reuse_local_attn_output=reuse_local_attn_output,
         )
     else:
         doc_online_kvs = online_forward_segments_batched(
@@ -2325,9 +2449,18 @@ def run_redknot_offlinekv(
         k_local_full = torch.cat(l_k_parts, dim=2)  # [1, Hkv, total_kv, D]
         v_local_full = torch.cat(l_v_parts, dim=2)
 
+        # The online RAG suffix is short.  It may read the complete immutable
+        # local-head KV without re-prefilling those document rows.  This keeps
+        # document compute head-sparse while preventing a target in the first
+        # offline document from becoming invisible behind a 4K query window.
+        if query_local_full_scope:
+            k_local = k_local_full
+            v_local = v_local_full
+            local_idx = torch.arange(total_kv, device=layer_device)
         # sink+window indices (shared across local heads; use the first one).
-        is_local_list = info["is_local"].tolist()
-        if any(is_local_list):
+        else:
+            is_local_list = info["is_local"].tolist()
+        if not query_local_full_scope and any(is_local_list):
             first_local_h = is_local_list.index(True)
             sink_size = info["sinks"][first_local_h]
             window_size = info["windows"][first_local_h]
@@ -2338,11 +2471,12 @@ def run_redknot_offlinekv(
             )
             k_local = k_local_full[:, :, local_idx, :]  # [1, Hkv, L_l, D]
             v_local = v_local_full[:, :, local_idx, :]
-        else:
+        elif not query_local_full_scope:
             # No local heads in this layer; local KV is unused but keep a
             # small placeholder to avoid None-handling downstream.
             k_local = k_local_full[:, :, :1, :]
             v_local = v_local_full[:, :, :1, :]
+            local_idx = torch.zeros(1, dtype=torch.long, device=layer_device)
 
         query_layer_kv.append(
             {
@@ -2351,6 +2485,9 @@ def run_redknot_offlinekv(
                 "k_local": k_local,
                 "v_local": v_local,
                 "is_local": info["is_local"].to(layer_device),
+                # True target positions are essential for the paged causal
+                # mask: compact local prefix offsets are not RoPE positions.
+                "local_positions": tuple(local_idx.tolist()) if query_backend == "managed_paged" else (),
             }
         )
 
@@ -2368,6 +2505,14 @@ def run_redknot_offlinekv(
     ).unsqueeze(0)
 
     apply_rotary = _get_apply_rotary(model.config.model_type)
+    managed_query_cache = None
+    if query_backend == "managed_paged":
+        from sglang.srt.layers.attention.redknot.managed_query import ManagedHeadClassQueryCache
+
+        managed_query_cache = ManagedHeadClassQueryCache(
+            query_layer_kv, query_offset=query_offset, query_length=query_len,
+            skip_invisible=paged_skip_invisible,
+        )
 
     def make_query_patched(layer_idx: int):
         attn_module = base_model.layers[layer_idx].self_attn
@@ -2401,21 +2546,27 @@ def run_redknot_offlinekv(
             # Append the query's own self KV so query tokens can attend to
             # each other and to themselves (causal among the suffix).
             # GLOBAL heads: [k_global | k_self]; LOCAL heads: [k_local | k_self].
-            k_g = torch.cat([kv["k_global"], k], dim=2)
-            v_g = torch.cat([kv["v_global"], v], dim=2)
-            k_l = torch.cat([kv["k_local"], k], dim=2)
-            v_l = torch.cat([kv["v_local"], v], dim=2)
+            if managed_query_cache is not None:
+                attn_out = managed_query_cache.attention(
+                    q, k, v, layer=layer_idx, num_q_per_kv=num_kv_groups,
+                    sm_scale=attn_module.scaling,
+                )
+            else:
+                k_g = torch.cat([kv["k_global"], k], dim=2)
+                v_g = torch.cat([kv["v_global"], v], dim=2)
+                k_l = torch.cat([kv["k_local"], k], dim=2)
+                v_l = torch.cat([kv["v_local"], v], dim=2)
 
-            attn_out = _query_headclass_attention(
-                q,
-                k_g,
-                v_g,
-                k_l,
-                v_l,
-                kv["is_local"],
-                num_q_per_kv=num_kv_groups,
-                sm_scale=attn_module.scaling,
-            )
+                attn_out = _query_headclass_attention(
+                    q,
+                    k_g,
+                    v_g,
+                    k_l,
+                    v_l,
+                    kv["is_local"],
+                    num_q_per_kv=num_kv_groups,
+                    sm_scale=attn_module.scaling,
+                )
 
             attn_output = attn_out.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -2434,29 +2585,28 @@ def run_redknot_offlinekv(
     finally:
         for layer_idx in range(n_layers):
             base_model.layers[layer_idx].self_attn.forward = orig_forwards[layer_idx]
+        if managed_query_cache is not None:
+            managed_query_cache.close()
+            if timing_stats is not None:
+                timing_stats.update(managed_query_cache.stats)
+            managed_query_cache = None
 
     first_logits = out.logits[0, -1, :].clone()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    ttft = time.perf_counter() - t_start
+    _t_after_query = time.perf_counter()
 
     # Phase timing
     _t_online = _t_after_online - t_start
     _t_rope = _t_after_rope - _t_after_online
     _t_kv = _t_after_kv - _t_after_rope
-    _t_query = ttft - (_t_online + _t_rope + _t_kv)
-    import sys as _sys
-
-    print(
-        f"  [headclass] online={_t_online:.3f}s  rope={_t_rope:.3f}s  "
-        f"kv_build={_t_kv:.3f}s  query_fwd={_t_query:.3f}s  "
-        f"total_ttft={ttft:.3f}s",
-        file=_sys.stderr,
-    )
+    _t_query = _t_after_query - _t_after_kv
 
     # ── E. Greedy decode (all heads attend full KV — correctness first) ──
-    # Decode is only a few dozen tokens and is OUTSIDE TTFT, so head-class
+    # Subsequent decode is outside TTFT, but cache construction and the seed
+    # forward below must be included because they produce the first emitted
+    # token. Decode is only a few dozen tokens, so head-class
     # sparsity here buys almost nothing while the per-head sliding-window
     # bookkeeping is error-prone. We therefore build a standard DynamicCache
     # from the full (global) re-prefilled KV and let every head attend the
@@ -2491,9 +2641,10 @@ def run_redknot_offlinekv(
     _q_orig = _switch_attn_impl(model, "sdpa")
     try:
         # Seed the cache with the query tokens (positions [total_kv,
-        # total_kv+query_len)). Their logits reproduce first_logits; we keep
-        # first_logits from Phase D (head-class) for the cosine metric but
-        # drive decode from this consistent full-attention cache.
+        # total_kv+query_len)). These full-attention logits can differ from
+        # Phase D's head-class logits. The compatibility default emits the
+        # seed logits; quality experiments may explicitly emit head-class
+        # logits. Both retain this seed forward inside emitted-token TTFT.
         cpos = torch.arange(total_kv, total_kv + query_len, device=device)
         seed = model(
             input_ids=query_ids,
@@ -2503,8 +2654,31 @@ def run_redknot_offlinekv(
             use_cache=True,
         )
         past = seed.past_key_values
-        next_id = seed.logits[0, -1, :].argmax().unsqueeze(0).unsqueeze(0)
+        decode_logits = (first_logits if decode_first_token_from_headclass
+                         else seed.logits[0, -1, :])
+        next_id = decode_logits.argmax().unsqueeze(0).unsqueeze(0)
         generated.append(int(next_id[0, 0].item()))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        ttft = time.perf_counter() - t_start
+        if timing_stats is not None:
+            timing_stats.update(
+                online_seconds=_t_online, rope_seconds=_t_rope,
+                kv_build_seconds=_t_kv, query_forward_seconds=_t_query,
+                headclass_query_ready_seconds=_t_after_query - t_start,
+                decode_prepare_and_seed_seconds=ttft - (_t_after_query - t_start),
+                emitted_first_token_seconds=ttft,
+                emitted_first_token_id=generated[0],
+            )
+        import sys as _sys
+
+        print(
+            f"  [headclass:{query_backend}] online={_t_online:.3f}s  rope={_t_rope:.3f}s  "
+            f"kv_build={_t_kv:.3f}s  query_fwd={_t_query:.3f}s  "
+            f"seed_and_prepare={ttft - (_t_after_query - t_start):.3f}s  "
+            f"emitted_ttft={ttft:.3f}s",
+            file=_sys.stderr,
+        )
         total_seen = total_kv + query_len
         for step in range(max_new_tokens - 1):
             cur_pos = total_seen + len(generated) - 1
@@ -2525,8 +2699,12 @@ def run_redknot_offlinekv(
         _restore_attn_impl(model, _q_orig)
 
     text = tokenizer.decode(generated, skip_special_tokens=True)
+    if timing_stats is not None:
+        timing_stats["generated_token_ids"] = list(generated)
     del out, past
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if timing_stats is not None:
+        timing_stats["request_completed_seconds"] = time.perf_counter() - t_start
     return first_logits, text, query_len, ttft

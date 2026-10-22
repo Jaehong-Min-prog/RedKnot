@@ -40,6 +40,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.head_kv.production import (
+    managed_forward_guard,
+    reject_managed_weight_update,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
@@ -93,6 +97,7 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    @reject_managed_weight_update
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path,
@@ -143,6 +148,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    @reject_managed_weight_update
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
@@ -155,6 +161,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    @reject_managed_weight_update
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
@@ -166,6 +173,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    @reject_managed_weight_update
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
@@ -444,6 +452,7 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    @managed_forward_guard
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],

@@ -259,6 +259,33 @@ class HeadKVManager:
                 raise RuntimeError("pool quarantined")
             return self._requests[request_id]
 
+    def metadata_snapshots(self, source_ids, *, source_is_cache=False):
+        """Capture immutable committed roots without a KV consumer lease.
+
+        Only CPU metadata may be inspected through these snapshots: they do
+        not pin pages, authorize tensor reads, or preserve source residency.
+        An alias publisher must pass every captured root as expected_sources
+        to share_segments_many, which revalidates identities and retains the
+        destination's references atomically under this manager's lock. Source
+        removal/rewrite between capture and publication must fail, not reuse
+        a stale physical slot. Actual KV consumers must continue to bind().
+
+        Pending writes do not replace their committed root. Resolve all IDs
+        in one lock scope, including duplicate source occurrences. Materialize
+        and validate the iterable before locking so its callbacks cannot
+        mutate a partly captured collection through the reentrant lock.
+        """
+        if type(source_is_cache) is not bool:
+            raise ValueError("source_is_cache must be a bool")
+        source_ids = tuple(source_ids)
+        if any(type(source_id) is not str or not source_id for source_id in source_ids):
+            raise ValueError("metadata source IDs must be nonempty built-in strings")
+        with self._lock:
+            if self.pool.poisoned:
+                raise RuntimeError("pool quarantined")
+            roots = self._cache if source_is_cache else self._requests
+            return MappingProxyType({source_id: roots[source_id] for source_id in source_ids})
+
     def bind(self, request_id):
         with self._lock:
             if self.pool.poisoned:
@@ -310,9 +337,17 @@ class HeadKVManager:
         if write.k.device != write.v.device:
             raise ValueError("K/V device mismatch")
 
-    def begin_update(self, request_id, *, writes=(), patches=(), remove=(), expected_epoch=None):
-        """Validate and reserve the entire write set before issuing any copies."""
+    def begin_update(self, request_id, *, writes=(), patches=(), remove=(), expected_epoch=None,
+                     batched_writes=False):
+        """Validate and reserve the entire write set before issuing any copies.
+
+        ``batched_writes`` opts full-segment payloads into a two-copy slab
+        writer. The default per-page path, patch semantics, atomic publication
+        and completion-event retirement are unchanged.
+        """
         with self._lock:
+            if type(batched_writes) is not bool:
+                raise ValueError("batched_writes must be a bool")
             old = self._requests[request_id]
             if request_id in self._pending:
                 raise RuntimeError("request already has a pending writer")
@@ -323,12 +358,29 @@ class HeadKVManager:
                 raise ValueError("each segment may appear once in a transaction")
             total = 0
             patch_groups = []
+            # Positions are often identical immutable tuples across hundreds
+            # of heads. Memoize only successfully checked built-in tuples of
+            # built-in ints, by identity (never an O(tokens) value hash). Keep
+            # the object alive to prevent id reuse; mutable/custom sequences
+            # and stateful int/tuple subclasses retain full validation.
+            validated_positions = {}
             for w in writes:
                 self._validate_write(w)
-                if len(w.positions) != len(w.k) or len(set(w.positions)) != len(w.positions):
+                positions = w.positions
+                # Payload length remains a per-write check, even on cache hit.
+                if len(positions) != len(w.k):
                     raise ValueError("positions must match payload, with no duplicates")
-                if any(not isinstance(x, int) or x < 0 for x in w.positions):
-                    raise ValueError("invalid logical position")
+                if validated_positions.get(id(positions)) is not positions:
+                    if len(set(positions)) != len(positions):
+                        raise ValueError("positions must match payload, with no duplicates")
+                    cacheable = type(positions) is tuple
+                    for position in positions:
+                        if not isinstance(position, int) or position < 0:
+                            raise ValueError("invalid logical position")
+                        if type(position) is not int:
+                            cacheable = False
+                    if cacheable:
+                        validated_positions[id(positions)] = positions
                 if w.reuse_kind not in ("exact_context", "certified_transform", "policy_approximate"):
                     raise ValueError("unknown reuse kind")
                 if not isinstance(w.validity_certificate, str) or (w.reuse_kind != "exact_context" and not w.validity_certificate):
@@ -356,11 +408,15 @@ class HeadKVManager:
             try:
                 lease = ReadLease(self.pool, old)
                 for w in writes:
-                    pages = []
-                    for i in range(0, len(w.k), self.pool.page_size):
-                        ref = next(cursor)
-                        self.pool.write_page(ref, w.k[i:i+self.pool.page_size], w.v[i:i+self.pool.page_size])
-                        pages.append(ref)
+                    if batched_writes:
+                        pages = tuple(next(cursor) for _ in range(math.ceil(len(w.k) / self.pool.page_size)))
+                        self.pool.write_segment_pages(pages, w.k, w.v)
+                    else:
+                        pages = []
+                        for i in range(0, len(w.k), self.pool.page_size):
+                            ref = next(cursor)
+                            self.pool.write_page(ref, w.k[i:i+self.pool.page_size], w.v[i:i+self.pool.page_size])
+                            pages.append(ref)
                     segments[w.key] = Segment(w.key, tuple(pages), tuple(w.positions), w.provenance,
                                               w.position_basis, w.reuse_kind, w.validity_certificate)
                 batch_plans = []
@@ -406,54 +462,160 @@ class HeadKVManager:
 
     def share_segment(self, source_id, target_id, source_key, target_key, *, proof,
                       positions=None, source_is_cache=False):
+        return self.share_segments(source_id, target_id,
+                                   [(source_key, target_key, proof, positions)],
+                                   source_is_cache=source_is_cache)
+
+    @staticmethod
+    def _prepare_shared_segment(source, target, source_key, target_key, proof, positions):
+        """Validate one alias without changing any root, ownership or pins."""
+        s = source.segments[source_key]
+        pos = s.positions if positions is None else tuple(positions)
+        if proof.source_provenance != s.provenance or proof.target_context != target.context_id:
+            raise ValueError("reuse proof does not bind source and target")
+        if proof.kind == "exact_context":
+            if source.context_id != target.context_id or pos != s.positions:
+                raise ValueError("exact reuse requires identical context and positions")
+        elif proof.kind in ("certified_transform", "policy_approximate"):
+            if not isinstance(proof.certificate, str) or not proof.certificate:
+                raise ValueError("explicit adapter certificate/policy required")
+        else:
+            raise ValueError("unknown reuse proof kind")
+        # Published source positions were validated at their creation. The
+        # canonical no-transform case can reuse that immutable tuple without
+        # repeatedly constructing a token-length set for every KV head.
+        if positions is not None:
+            if len(pos) != s.length or len(set(pos)) != len(pos) or any(not isinstance(p, int) or p < 0 for p in pos):
+                raise ValueError("invalid target positions")
+        if pos != s.positions and s.position_basis != "none":
+            raise ValueError("position-encoded K requires materialized adapter transform before reuse")
+        if (not isinstance(target_key, tuple) or len(target_key) != 3
+                or target_key[:2] != source_key[:2] or not isinstance(target_key[2], str)):
+            raise ValueError("cannot alias a different layer/KV group")
+        # Preserve approximate/transformed lineage, including when an exact
+        # context alias is requested downstream of an approximate source.
+        if proof.kind == "exact_context":
+            kind, certificate = s.reuse_kind, s.validity_certificate
+        elif s.reuse_kind == "exact_context":
+            kind, certificate = proof.kind, proof.certificate
+        else:
+            kind = ("policy_approximate" if "policy_approximate" in (s.reuse_kind, proof.kind)
+                    else "certified_transform")
+            lineage = [s.reuse_kind, s.provenance, s.validity_certificate,
+                       proof.kind, proof.certificate, target.context_id, pos]
+            certificate = "lineage-v1:" + hashlib.sha256(
+                json.dumps(lineage, separators=(",", ":")).encode()).hexdigest()
+        return replace(s, key=target_key, positions=pos, reuse_kind=kind,
+                       validity_certificate=certificate)
+
+    def share_segments(self, source_id, target_id, shares, *, source_is_cache=False):
+        """Publish many certified aliases atomically, with one root epoch.
+
+        ``shares`` contains ``(source_key, target_key, proof)`` triples, or
+        quadruples with an optional explicit positions sequence. All aliases
+        resolve against one captured source root; chained references to an
+        alias created earlier in this batch are not supported. Destination
+        keys must be unique. Empty batches return the current root unchanged.
+
+        Namespace, model contract, position encoding and provenance rules are
+        identical to share_segment. Validation of the *entire* batch precedes
+        page ownership changes. Only references added/removed by the new root
+        change owners; repeated occurrences in a root still own a page once.
+        Read leases pin prior roots independently of this atomic publication.
+        """
+        return self.share_segments_many(
+            target_id, [(source_id, shares, bool(source_is_cache))])
+
+    def share_segments_many(self, target_id, sources, *, expected_epoch=None,
+                            expected_sources=None):
+        """Publish aliases from multiple source roots in one atomic update.
+
+        Each item of ``sources`` is ``(source_id, shares)`` or
+        ``(source_id, shares, source_is_cache)``. ``shares`` has the same
+        triples/quadruples accepted by :meth:`share_segments`. Source roots
+        are captured once under the manager lock, including repeated sources
+        and the target itself. Aliases never resolve against another alias
+        created within this batch. Destinations must be unique across *all*
+        sources; replacing an existing target segment is supported.
+
+        ``expected_sources``, when supplied, maps every selected
+        ``(source_id, source_is_cache)`` to the exact RequestVersion captured
+        by the caller. This binds adapter proofs to pinned read snapshots;
+        an intervening source update/eviction is rejected, not silently
+        rebound. Pending source writes do not affect their committed roots.
+
+        All source contracts, provenance, positions and proofs are validated
+        before any ownership changes. No KV pages are allocated or copied.
+        One old/new reference scan, one differential retain/release, and one
+        target publication cover the entire batch. Prior readers retain
+        their own pins and source eviction cannot race with publication.
+        """
         with self._lock:
-            source = (self._cache if source_is_cache else self._requests)[source_id]
+            if self.pool.poisoned:
+                raise RuntimeError("pool quarantined")
             target = self._requests[target_id]
             if target_id in self._pending:
                 raise RuntimeError("target has a pending writer")
-            s = source.segments[source_key]
-            pos = s.positions if positions is None else tuple(positions)
-            if (source.contract, source.namespace) != (target.contract, target.namespace):
-                raise ValueError("namespace/model contract mismatch")
-            if proof.source_provenance != s.provenance or proof.target_context != target.context_id:
-                raise ValueError("reuse proof does not bind source and target")
-            if proof.kind == "exact_context":
-                if source.context_id != target.context_id or pos != s.positions:
-                    raise ValueError("exact reuse requires identical context and positions")
-            elif proof.kind in ("certified_transform", "policy_approximate"):
-                if not isinstance(proof.certificate, str) or not proof.certificate:
-                    raise ValueError("explicit adapter certificate/policy required")
-            else:
-                raise ValueError("unknown reuse proof kind")
-            if len(pos) != s.length or len(set(pos)) != len(pos) or any(not isinstance(p, int) or p < 0 for p in pos):
-                raise ValueError("invalid target positions")
-            if pos != s.positions and s.position_basis != "none":
-                raise ValueError("position-encoded K requires materialized adapter transform before reuse")
-            if target_key[:2] != source_key[:2] or not isinstance(target_key[2], str):
-                raise ValueError("cannot alias a different layer/KV group")
-            # Copying an approximate or transformed state into an identical
-            # context cannot erase its upstream validity lineage. Certificates
-            # are trusted adapter attestations, not proofs checked by this engine.
-            if proof.kind == "exact_context":
-                kind, certificate = s.reuse_kind, s.validity_certificate
-            elif s.reuse_kind == "exact_context":
-                kind, certificate = proof.kind, proof.certificate
-            else:
-                kind = ("policy_approximate" if "policy_approximate" in (s.reuse_kind, proof.kind)
-                        else "certified_transform")
-                # Keep a bounded lineage digest rather than concatenate an
-                # unbounded certificate chain at each reuse hop.
-                lineage = [s.reuse_kind, s.provenance, s.validity_certificate,
-                           proof.kind, proof.certificate, target.context_id, pos]
-                certificate = "lineage-v1:" + hashlib.sha256(
-                    json.dumps(lineage, separators=(",", ":")).encode()).hexdigest()
+            if expected_epoch is not None and expected_epoch != target.epoch:
+                raise RuntimeError("stale table epoch")
+            prepared, destinations = [], set()
+            captured = {}
+            for batch in sources:
+                if not isinstance(batch, (tuple, list)) or len(batch) not in (2, 3):
+                    raise ValueError("a source batch must be (source_id, shares[, source_is_cache])")
+                source_id, shares = batch[:2]
+                source_is_cache = batch[2] if len(batch) == 3 else False
+                if type(source_is_cache) is not bool:
+                    raise ValueError("source_is_cache must be a bool")
+                identity = source_id, source_is_cache
+                if identity not in captured:
+                    source = (self._cache if source_is_cache else self._requests)[source_id]
+                    if expected_sources is not None and expected_sources.get(identity) is not source:
+                        raise RuntimeError("stale source generation/version")
+                    if (source.contract, source.namespace) != (target.contract, target.namespace):
+                        raise ValueError("namespace/model contract mismatch")
+                    captured[identity] = source
+                source = captured[identity]
+                for item in shares:
+                    if not isinstance(item, (tuple, list)) or len(item) not in (3, 4):
+                        raise ValueError("a share must be (source_key, target_key, proof[, positions])")
+                    source_key, target_key, proof = item[:3]
+                    positions = item[3] if len(item) == 4 else None
+                    segment = self._prepare_shared_segment(source, target, source_key, target_key, proof, positions)
+                    if target_key in destinations:
+                        raise ValueError("duplicate target segment in share batch")
+                    destinations.add(target_key)
+                    prepared.append(segment)
+            # Iterables may execute caller code while being consumed. The
+            # RLock excludes other threads, not re-entrant manager operations
+            # from that code; never overwrite a root changed in that window.
+            if self._requests.get(target_id) is not target or target_id in self._pending:
+                raise RuntimeError("stale target generation/version")
+            for (source_id, source_is_cache), source in captured.items():
+                if (self._cache if source_is_cache else self._requests).get(source_id) is not source:
+                    raise RuntimeError("stale source generation/version")
+            if not prepared:
+                return target
             segs = dict(target.segments)
-            segs[target_key] = replace(s, key=target_key, positions=pos, reuse_kind=kind,
-                                       validity_certificate=certificate)
+            segs.update((s.key, s) for s in prepared)
             new = replace(target, epoch=target.epoch+1, segments=MappingProxyType(segs))
-            self.pool.retain(_refs(segs))
-            self._requests[target_id] = new
-            self.pool.release(_refs(target.segments))
+            old_refs, new_refs = set(_refs(target.segments)), set(_refs(segs))
+            added, removed = tuple(new_refs-old_refs), tuple(old_refs-new_refs)
+            # retain() validates every generation before incrementing any
+            # owner. If it fails, the target root remains exactly unchanged.
+            self.pool.retain(added)
+            try:
+                self._requests[target_id] = new
+            except BaseException:
+                self.pool.release(added)
+                raise
+            try:
+                self.pool.release(removed)
+            except BaseException:
+                # Like WriteTransaction.commit, a published root must not be
+                # rolled back after a lifetime failure. Quarantine instead.
+                self.pool.poisoned = True
+                raise
             return new
 
     def truncate_segment(self, request_id, key, length):

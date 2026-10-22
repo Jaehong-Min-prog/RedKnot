@@ -82,6 +82,20 @@ class HeadPagePool:
         self._boot = uuid.uuid4().hex
         self._sequence = 0
         self._retained_buffers = []
+        # Only event-bearing pages or immediately reclaimable orphans need a
+        # collection visit. Pinned orphans without events re-enter this index
+        # on unpin; immutable live pages do not participate in every sweep.
+        # Store complete refs, not bare slots, to preserve generation fencing.
+        self._collection_candidates: dict[int, PageRef] = {}
+        self._reserved_pages = 0
+        self._live_pages = 0
+        self._retiring_pages = 0
+        self._pinned_pages = 0
+        self._collection_calls = 0
+        self._collection_candidate_visits = 0
+        self._collection_event_queries = 0
+        self._collection_buffer_visits = 0
+        self._reclaimed_pages = 0
         self.poisoned = False
         self.high_water_pages = 0
         self.copied_bytes = 0
@@ -96,6 +110,25 @@ class HeadPagePool:
         if p is None or p.ref != ref:
             raise StaleReference(f"stale page slot/generation: {ref.slot}/{ref.generation}")
         return p
+
+    @staticmethod
+    def _lifecycle(p):
+        return (not p.sealed and p.owners > 0,
+                p.sealed and p.owners > 0,
+                p.owners == 0,
+                p.pins > 0 or bool(p.events))
+
+    def _refresh_lifecycle(self, p, before):
+        """Update gauges and retirement index for one mutated page, under lock."""
+        after = self._lifecycle(p)
+        self._reserved_pages += after[0] - before[0]
+        self._live_pages += after[1] - before[1]
+        self._retiring_pages += after[2] - before[2]
+        self._pinned_pages += after[3] - before[3]
+        if p.events or (p.owners == 0 and p.pins == 0):
+            self._collection_candidates[p.ref.slot] = p.ref
+        else:
+            self._collection_candidates.pop(p.ref.slot, None)
 
     def reserve(self, count: int, *, content_ids=None) -> tuple[PageRef, ...]:
         if count < 0:
@@ -128,6 +161,9 @@ class HeadPagePool:
                     self._pages.pop(slot, None)
                 self._free = free_before
                 raise
+            # No retirement index or gauges are published until reservation
+            # succeeds, so partial metadata-allocation rollback stays atomic.
+            self._reserved_pages += count
             self.high_water_pages = max(self.high_water_pages, len(self._pages))
             return tuple(result)
 
@@ -135,7 +171,9 @@ class HeadPagePool:
         with self._lock:
             pages = [self._get(r) for r in refs]
             for p in pages:
+                before = self._lifecycle(p)
                 p.owners += 1
+                self._refresh_lifecycle(p, before)
 
     def release(self, refs: Iterable[PageRef], event=None):
         with self._lock:
@@ -143,16 +181,20 @@ class HeadPagePool:
             for p in pages:
                 if p.owners <= 0:
                     raise RuntimeError("unbalanced page release")
+                before = self._lifecycle(p)
                 p.owners -= 1
                 if event is not None:
                     p.events.append(event)
+                self._refresh_lifecycle(p, before)
             self.collect()
 
     def pin(self, refs: Iterable[PageRef]):
         with self._lock:
             pages = [self._get(r) for r in refs]
             for p in pages:
+                before = self._lifecycle(p)
                 p.pins += 1
+                self._refresh_lifecycle(p, before)
 
     def unpin(self, refs: Iterable[PageRef], event=None):
         with self._lock:
@@ -160,9 +202,11 @@ class HeadPagePool:
             for p in pages:
                 if p.pins <= 0:
                     raise RuntimeError("unbalanced page unpin")
+                before = self._lifecycle(p)
                 p.pins -= 1
                 if event is not None:
                     p.events.append(event)
+                self._refresh_lifecycle(p, before)
             self.collect()
 
     def write_page(self, ref, k, v):
@@ -179,6 +223,68 @@ class HeadPagePool:
             self.v[ref.slot, :n].copy_(v)
             p.extent = n
             self.written_bytes += 2 * n * self.head_dim * self.k.element_size()
+
+    def write_segment_pages(self, refs, k, v):
+        """Write one new segment with two payload copies, not two per page.
+
+        Ordered ``refs`` must exactly cover the payload, with a possibly
+        partial final page. All destination generations, ownership, shapes
+        and extents are validated before any device write. These are private
+        unpublished pages: publication and asynchronous failure retirement
+        remain the caller's transaction responsibility, as for write_page.
+
+        Contiguous ascending slots use a flat slab slice; fragmented slots
+        use one row-indexed copy per K/V tensor. Only the supplied new payload
+        is read. Historical KV is never gathered, and padding is untouched.
+        A payload borrowed from this slab (e.g. a small boundary repair) is
+        staged before writes, avoiding source/destination storage overlap.
+        """
+        with self._lock:
+            if self.poisoned:
+                raise RuntimeError("pool quarantined")
+            refs = tuple(refs)
+            if len(set(refs)) != len(refs):
+                raise ValueError("segment destinations must be unique")
+            pages = [self._get(ref) for ref in refs]
+            if any(page.sealed or page.owners != 1 or page.pins for page in pages):
+                raise RuntimeError("write requires unpublished exclusively owned unpinned pages")
+            if (not torch.is_tensor(k) or not torch.is_tensor(v)
+                    or k.layout != torch.strided or v.layout != torch.strided
+                    or k.ndim != 2 or k.shape != v.shape or k.shape[1] != self.head_dim
+                    or k.device != v.device or k.device.type == "meta"):
+                raise ValueError("invalid K/V segment payload shape/layout/device")
+            rows = len(k)
+            expected = (rows + self.page_size - 1) // self.page_size
+            if len(refs) != expected:
+                raise ValueError("segment references must exactly cover payload extent")
+            if not rows:
+                return
+
+            # Materialize conversions and explicitly borrowed payloads before
+            # either write. This also makes fragmented index_copy_ semantics
+            # match copy_'s accepted dtype/device conversions.
+            slab_storage = {self.k.untyped_storage().data_ptr(), self.v.untyped_storage().data_ptr()}
+            def payload(tensor):
+                borrowed = (tensor.device == self.device
+                            and tensor.untyped_storage().data_ptr() in slab_storage)
+                value = tensor.to(device=self.device, dtype=self.dtype)
+                return value.clone() if borrowed else value
+            new_k, new_v = payload(k), payload(v)
+            slots = [ref.slot for ref in refs]
+            k_flat, v_flat = self.k.view(-1, self.head_dim), self.v.view(-1, self.head_dim)
+            if all(slot == slots[0] + i for i, slot in enumerate(slots)):
+                start = slots[0] * self.page_size
+                k_flat[start:start + rows].copy_(new_k)
+                v_flat[start:start + rows].copy_(new_v)
+            else:
+                slot_indices = torch.tensor(slots, device=self.device, dtype=torch.long)
+                row_indices = (slot_indices[:, None] * self.page_size
+                               + torch.arange(self.page_size, device=self.device)[None, :]).reshape(-1)[:rows]
+                k_flat.index_copy_(0, row_indices, new_k)
+                v_flat.index_copy_(0, row_indices, new_v)
+            for i, page in enumerate(pages):
+                page.extent = min(self.page_size, rows - i * self.page_size)
+            self.written_bytes += 2 * rows * self.head_dim * self.k.element_size()
 
     def clone_patch(self, source, dest, extent, indices, k, v):
         """Copy retained rows only; a complete rewrite performs zero old KV copy."""
@@ -296,7 +402,9 @@ class HeadPagePool:
                 p = self._get(ref)
                 if p.extent <= 0:
                     raise ValueError("cannot publish an uninitialized page")
+                before = self._lifecycle(p)
                 p.sealed = True
+                self._refresh_lifecycle(p, before)
 
     def read_page(self, ref, extent=None):
         with self._lock:
@@ -310,6 +418,7 @@ class HeadPagePool:
 
     def collect(self):
         with self._lock:
+            self._collection_calls += 1
             if self.poisoned:
                 return 0
             freed = 0
@@ -326,25 +435,39 @@ class HeadPagePool:
                 key = id(event)
                 cached = queried.get(key)
                 if cached is None:
+                    self._collection_event_queries += 1
                     cached = (event, bool(event.query()))
                     queried[key] = cached
                 return cached[1]
 
             try:
+                self._collection_buffer_visits += len(self._retained_buffers)
                 self._retained_buffers[:] = [(e, buffers) for e, buffers in self._retained_buffers if not complete(e)]
-            except Exception:
+            except BaseException:
                 self.poisoned = True
                 raise
-            for slot, p in list(self._pages.items()):
+            for slot, ref in tuple(self._collection_candidates.items()):
+                self._collection_candidate_visits += 1
+                p = self._pages.get(slot)
+                if p is None or p.ref != ref:
+                    # Defensive ABA fencing. Normal allocation/free paths
+                    # remove the old candidate before making a slot reusable.
+                    self._collection_candidates.pop(slot, None)
+                    continue
+                before = self._lifecycle(p)
                 try:
                     p.events[:] = [e for e in p.events if not complete(e)]
-                except Exception:
+                except BaseException:
                     self.poisoned = True
                     raise
+                self._refresh_lifecycle(p, before)
                 if p.owners == 0 and p.pins == 0 and not p.events:
                     del self._pages[slot]
+                    self._collection_candidates.pop(slot, None)
+                    self._retiring_pages -= 1
                     self._free.append(slot)
                     freed += 1
+                    self._reclaimed_pages += 1
             return freed
 
     def defer_buffers(self, buffers, event):
@@ -354,14 +477,29 @@ class HeadPagePool:
     def stats(self):
         with self._lock:
             self.collect()
-            reserved = sum(not p.sealed and p.owners > 0 for p in self._pages.values())
-            live = sum(p.sealed and p.owners > 0 for p in self._pages.values())
-            retiring = sum(p.owners == 0 for p in self._pages.values())
+            reserved, live, retiring = self._reserved_pages, self._live_pages, self._retiring_pages
             assert len(self._free) + reserved + live + retiring == self.capacity_pages
             return dict(capacity_pages=self.capacity_pages, free_pages=len(self._free),
                         reserved_pages=reserved, live_pages=live, retiring_pages=retiring,
-                        pinned_pages=sum(p.pins > 0 or bool(p.events) for p in self._pages.values()),
+                        pinned_pages=self._pinned_pages,
                         allocated_bytes=len(self._pages) * self.page_bytes,
                         reserved_slab_bytes=self.capacity_pages * self.page_bytes,
                         high_water_pages=self.high_water_pages, copied_bytes=self.copied_bytes,
                         written_bytes=self.written_bytes, poisoned=self.poisoned)
+
+    def collection_stats(self):
+        """Read-only work counters; does not collect or change lifecycle stats.
+
+        Candidate visits measure page metadata inspected, not CUDA execution
+        time. Event queries are deduplicated by identity within each pass;
+        buffer visits count deferred buffer entries, not individual tensors.
+        Kept separate from stats() so observation does not alter its snapshot.
+        """
+        with self._lock:
+            return dict(collection_calls=self._collection_calls,
+                        candidate_page_visits=self._collection_candidate_visits,
+                        event_queries=self._collection_event_queries,
+                        buffer_entries_visited=self._collection_buffer_visits,
+                        reclaimed_pages=self._reclaimed_pages,
+                        candidate_pages=len(self._collection_candidates),
+                        retained_buffer_entries=len(self._retained_buffers))

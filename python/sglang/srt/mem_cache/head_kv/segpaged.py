@@ -140,7 +140,7 @@ class ManagedSegPagedKVCache:
             return descriptor
 
     def attention(self, query, *, layer, query_positions, num_q_per_kv, sm_scale,
-                  use_fused=True, causal=True):
+                  use_fused=True, causal=True, skip_invisible=True):
         """Read one immutable version; retire its pin on the current CUDA stream."""
         self._key(layer, 0, "validation")
         if query_positions is None:
@@ -154,6 +154,7 @@ class ManagedSegPagedKVCache:
                 num_q_per_kv=num_q_per_kv, scale=sm_scale, causal=causal,
                 windows=[p[1] for p in policies], sinks=[p[2] for p in policies],
                 backend="auto" if use_fused else "torch",
+                skip_invisible=skip_invisible,
             )
 
     def physical_bytes(self):

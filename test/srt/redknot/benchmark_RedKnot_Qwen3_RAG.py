@@ -32,9 +32,11 @@ Model resolution order:
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import re
+import statistics
 import string
 import sys
 import time
@@ -116,6 +118,12 @@ MAX_NEW_TOKENS = int(os.environ.get("REDKNOT_MAX_NEW", "32"))
 # eventually OOM on a shared 80G node. It only affects speed, not F1/TTFT
 # correctness. Set REDKNOT_COMPILE=1 on a dedicated GPU to enable it.
 USE_COMPILE = os.environ.get("REDKNOT_COMPILE", "0") == "1"
+# Optional bounded head-page query backend; admission and seed-forward costs
+# are included in the driver's emitted-token TTFT for both query backends.
+QUERY_BACKEND = os.environ.get("REDKNOT_QUERY_BACKEND", "native")
+PAGED_SKIP_INVISIBLE = os.environ.get("REDKNOT_PAGED_SKIP_INVISIBLE", "1") == "1"
+if QUERY_BACKEND not in ("native", "managed_paged"):
+    raise ValueError("REDKNOT_QUERY_BACKEND must be native or managed_paged")
 SEG_TOKENS = int(os.environ.get("REDKNOT_SEG_TOKENS", "4000"))  # tokens per segment
 # Cap context length. 16K keeps the dense baseline's peak memory well under one
 # 80G GPU (leaves headroom on shared nodes) while still being a real
@@ -123,6 +131,21 @@ SEG_TOKENS = int(os.environ.get("REDKNOT_SEG_TOKENS", "4000"))  # tokens per seg
 # Raise via REDKNOT_MAX_CTX on a dedicated GPU for longer contexts.
 MAX_CTX_TOKENS = int(os.environ.get("REDKNOT_MAX_CTX", "16000"))
 SEED = 2026
+MIN_CTX_TOKENS = int(
+    os.environ.get("REDKNOT_MIN_CTX", str(int(MAX_CTX_TOKENS * 0.8)))
+)
+SELECTION_MODE = os.environ.get("REDKNOT_SELECTION_MODE", "hash_extractable")
+RESULT_OUT = os.environ.get("REDKNOT_RESULT_OUT", "")
+TTFT_WARMUP = int(os.environ.get("REDKNOT_TTFT_WARMUP", "0"))
+TTFT_ITERS = int(os.environ.get("REDKNOT_TTFT_ITERS", "0"))
+QUERY_LOCAL_FULL_SCOPE = os.environ.get(
+    "REDKNOT_QUERY_LOCAL_FULL_SCOPE", "1"
+) == "1"
+REUSE_LOCAL_ATTN_OUTPUT = os.environ.get(
+    "REDKNOT_REUSE_LOCAL_ATTN_OUTPUT", "1"
+) == "1"
+if TTFT_WARMUP < 0 or TTFT_ITERS < 0:
+    raise ValueError("TTFT warmup/iteration counts must be non-negative")
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -171,6 +194,41 @@ _PROMPT = (
     "explanation.\nQuestion: {q}\nAnswer:"
 )
 
+_CHAT_SENTINEL = "__REDKNOT_QWEN3_USER_CONTENT__"
+
+
+def _qwen3_chat_parts(tok):
+    """Return the exact official no-thinking user prefix/assistant suffix."""
+    rendered = tok.apply_chat_template(
+        [{"role": "user", "content": _CHAT_SENTINEL}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if rendered.count(_CHAT_SENTINEL) != 1:
+        raise RuntimeError("Qwen3 chat template did not preserve the sentinel exactly once")
+    return tuple(rendered.split(_CHAT_SENTINEL, 1))
+
+
+def _segmented_input_ids(tok, docs, query_text):
+    """Canonical IDs consumed by both recomputed and segmented RedKnot.
+
+    Documents are independently tokenized because that is the immutable
+    offline-artifact contract.  The recomputed reference receives this exact
+    concatenated ID list instead of re-tokenizing joined text, which can merge
+    a BPE token across a document/query seam and silently change the request.
+    """
+    segmented = []
+    for i, doc in enumerate(docs):
+        ids = tok(doc, add_special_tokens=False)["input_ids"]
+        if i == 0 and tok.bos_token_id is not None:
+            ids = [tok.bos_token_id] + ids
+        segmented.extend(ids)
+    segmented.extend(tok(query_text, add_special_tokens=False)["input_ids"])
+    if not segmented:
+        raise RuntimeError("canonical segmented request is empty")
+    return segmented
+
 
 def _load_longbench(name, tok, n_samples, seg_tokens, max_ctx_tokens):
     """Load up to ``n_samples`` rows, returning RedKnot-ready segmented docs.
@@ -186,38 +244,57 @@ def _load_longbench(name, tok, n_samples, seg_tokens, max_ctx_tokens):
     path = LONGBENCH_DIR / f"{name}.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"dataset not found: {path}")
-    rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
-    # Longest contexts first (char length is a cheap proxy for token length).
-    rows.sort(key=lambda r: len(str(r.get("context", ""))), reverse=True)
-    out = []
-    for r in rows:
-        ctx = str(r.get("context", "")).strip()
+    candidates = []
+    for row_index, raw in enumerate(path.read_text(encoding="utf-8").splitlines()):
+        r = json.loads(raw)
+        ctx = str(r.get("context", ""))
         q = str(r.get("input", "")).strip()
         ans = r.get("answers", [])
         if isinstance(ans, str):
             ans = [ans]
-        if not ctx or not q or not ans:
+        if not ctx.strip() or not q or not ans:
             continue
-        ids = tok(ctx, add_special_tokens=False)["input_ids"]
-        if len(ids) < seg_tokens:  # too short to exercise long-context reuse
+        full_ids = tok(ctx, add_special_tokens=False)["input_ids"]
+        if len(full_ids) < max(seg_tokens, MIN_CTX_TOKENS):
             continue
-        ids = ids[:max_ctx_tokens]
+        ids = full_ids[:max_ctx_tokens]
+        truncated_context = tok.decode(ids, skip_special_tokens=True)
+        if SELECTION_MODE == "hash_extractable":
+            normalized_context = _normalize(truncated_context)
+            if not any(
+                _normalize(str(g)) and _normalize(str(g)) in normalized_context
+                for g in ans
+            ):
+                continue
+        row_sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        selection_key = hashlib.sha256(
+            (
+                f"redknot-qwen3-holdout-v1\0{SEED}\0{name}\0{row_sha256}"
+            ).encode("utf-8")
+        ).hexdigest()
         # Split into segments of ~seg_tokens each.
         docs = [
             tok.decode(ids[i : i + seg_tokens], skip_special_tokens=True)
             for i in range(0, len(ids), seg_tokens)
         ]
-        out.append(
+        candidates.append(
             {
                 "question": q,
                 "answers": ans,
                 "docs": docs,
                 "n_ctx": len(ids),
+                "row_index": row_index,
+                "row_sha256": row_sha256,
+                "selection_key": selection_key,
             }
         )
-        if len(out) >= n_samples:
-            break
-    return out
+    if SELECTION_MODE == "longest":
+        candidates.sort(key=lambda x: (-x["n_ctx"], x["row_sha256"]))
+    elif SELECTION_MODE == "hash_extractable":
+        candidates.sort(key=lambda x: x["selection_key"])
+    else:
+        raise ValueError(f"unsupported REDKNOT_SELECTION_MODE={SELECTION_MODE!r}")
+    return candidates[:n_samples]
 
 
 def _short_ans(t):
@@ -308,36 +385,66 @@ def _attn_flops_dense(d, seg_lens):
     return flops
 
 
-def _attn_flops_headclass(d, seg_lens, frac_global, window):
+def _attn_flops_headclass_online(
+    d, seg_lens, frac_global, window, *, reuse_local_output=True
+):
+    """Online-only RedKnot attention FLOPs.
+
+    Segment zero is an already-materialised RAG prefix and is outside the
+    measured online TTFT.  It remains visible as KV to every later segment,
+    but none of its query rows are executed online.
+    """
     Hq = d["Hq"]
     Hg, Hl = Hq * frac_global, Hq * (1 - frac_global)
-    flops, prefix = 0.0, 0
-    for li in seg_lens:
+    if not seg_lens:
+        return 0.0
+    flops, prefix = 0.0, seg_lens[0]
+    for li in seg_lens[1:]:
         kv_g = li * prefix + li * (li + 1) / 2.0
         kv_l = li * min(window, prefix + li)
-        flops += d["L"] * 4.0 * d["D"] * (Hg * kv_g + Hl * kv_l)
+        local_term = 0.0 if reuse_local_output else Hl * kv_l
+        flops += d["L"] * 4.0 * d["D"] * (Hg * kv_g + local_term)
         prefix += li
     return flops
 
 
-def compute_flops(d, seg_lens, frac_global, sel_deep, dense_until, window):
+def compute_flops(
+    d,
+    seg_lens,
+    frac_global,
+    sel_deep,
+    dense_until,
+    dense_suffix_layers,
+    window,
+    reuse_local_attn_output,
+):
     tokens = sum(seg_lens)
+    online_tokens = sum(seg_lens[1:])
     proj = d["L"] * tokens * _proj_flops_per_token(d)
+    proj_hc = d["L"] * online_tokens * _proj_flops_per_token(d)
     ffn_dense = d["L"] * tokens * _ffn_flops_per_token(d)
-    dense_layers = min(dense_until, d["L"])
+    dense_layers = min(dense_until, d["L"]) + min(
+        dense_suffix_layers, max(0, d["L"] - dense_until)
+    )
     deep_layers = d["L"] - dense_layers
     ffn_hc = (
-        dense_layers * tokens * _ffn_flops_per_token(d)
-        + deep_layers * tokens * _ffn_flops_per_token(d) * sel_deep
+        dense_layers * online_tokens * _ffn_flops_per_token(d)
+        + deep_layers * online_tokens * _ffn_flops_per_token(d) * sel_deep
     )
     attn_dense = _attn_flops_dense(d, seg_lens)
-    attn_hc = _attn_flops_headclass(d, seg_lens, frac_global, window)
+    attn_hc = _attn_flops_headclass_online(
+        d,
+        seg_lens,
+        frac_global,
+        window,
+        reuse_local_output=reuse_local_attn_output,
+    )
     total_dense = proj + ffn_dense + attn_dense
-    total_hc = proj + ffn_hc + attn_hc
+    total_hc = proj_hc + ffn_hc + attn_hc
     return {
         "attn": (attn_dense, attn_hc),
         "ffn": (ffn_dense, ffn_hc),
-        "proj": (proj, proj),
+        "proj": (proj, proj_hc),
         "total": (total_dense, total_hc),
     }
 
@@ -345,12 +452,24 @@ def compute_flops(d, seg_lens, frac_global, sel_deep, dense_until, window):
 # ── Standard fastest dense prefill baseline (FA-2) ──
 @torch.no_grad()
 def standard_prefill(
-    model, tok, full_text, query_text, max_new_tokens, prefill_chunk=8192
+    model,
+    tok,
+    full_text,
+    query_text,
+    max_new_tokens,
+    prefill_chunk=8192,
+    *,
+    input_ids=None,
 ):
     device = model.device
-    ids = tok(full_text + query_text, return_tensors="pt", add_special_tokens=False)[
-        "input_ids"
-    ].to(device)
+    if input_ids is None:
+        ids = tok(
+            full_text + query_text,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].to(device)
+    else:
+        ids = torch.tensor([input_ids], dtype=torch.long, device=device)
     n_ctx = ids.shape[1]
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -389,12 +508,26 @@ def standard_prefill(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     dec_t = max(time.perf_counter() - t1, 1e-3)
-    return tok.decode(gen, skip_special_tokens=True), ttft, len(gen) / dec_t, n_ctx
+    return first, tok.decode(gen, skip_special_tokens=True), ttft, len(gen) / dec_t, n_ctx
 
 
 def _trunc(s, n=40):
     s = (s or "").replace("\n", " ").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _percentile(values, q):
+    """Linearly interpolated percentile without a NumPy dependency."""
+    xs = sorted(float(x) for x in values)
+    if not xs:
+        raise ValueError("cannot take a percentile of an empty sequence")
+    if len(xs) == 1:
+        return xs[0]
+    pos = (len(xs) - 1) * float(q)
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = pos - lo
+    return xs[lo] * (1.0 - frac) + xs[hi] * frac
 
 
 def main():
@@ -411,10 +544,12 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    chat_prefix, chat_suffix = _qwen3_chat_parts(tok)
 
     hc = _head_config()
     summ = hc.summary()
-    frac_global = summ.get("global", 0) / summ["total"]
+    online_global_heads = summ.get("global", 0) + summ.get("dense", 0)
+    frac_global = online_global_heads / summ["total"]
     local_window = _local_window_from_cfg(hc)
     ffn_cfg = _ffn_config()
     sched = SparseFFNSchedule(**ffn_cfg)
@@ -435,20 +570,34 @@ def main():
     d = _model_dims(model.config)
 
     print(
-        f" Heads: {summ.get('global', 0)} global + {summ.get('local', 0)} local "
+        f" Heads: {online_global_heads} global/full + "
+        f"{summ.get('local', 0)} local "
         f"(frac_global={frac_global:.3f}) | local_window={local_window}"
     )
     print(
         f" Sparse FFN: mass_thresh={ffn_cfg['mass_thresh']} "
-        f"(deep {ffn_cfg['mass_thresh_deep']}), dense_until={ffn_cfg['dense_until']}"
+        f"(deep {ffn_cfg['mass_thresh_deep']}), "
+        f"dense_prefix={ffn_cfg['dense_until']} "
+        f"dense_suffix={ffn_cfg.get('dense_suffix_layers', 0)}"
     )
     print(
         f" Samples/dataset={N_SAMPLES}  seg_tokens={SEG_TOKENS}  "
         f"max_ctx={MAX_CTX_TOKENS}  max_new={MAX_NEW_TOKENS}  compile={USE_COMPILE}"
     )
+    print(
+        f" TTFT protocol: symmetric_warmup={TTFT_WARMUP} "
+        f"paired_iters={TTFT_ITERS} order=AB/BA"
+    )
+    print(f" Query local-head scope: {'full cached KV' if QUERY_LOCAL_FULL_SCOPE else 'window'}")
+    print(f" Reuse local attention output: {REUSE_LOCAL_ATTN_OUTPUT}")
+    print(
+        f" Selection: mode={SELECTION_MODE} seed={SEED} min_ctx={MIN_CTX_TOKENS}"
+    )
+    print(f" Query backend: {QUERY_BACKEND}; TTFT includes the emitted first token")
 
     chunk_size = max(4096, SEG_TOKENS + 96)
     overall = {}
+    all_cases = []
 
     for name in DATASETS:
         samples = _load_longbench(name, tok, N_SAMPLES, SEG_TOKENS, MAX_CTX_TOKENS)
@@ -463,13 +612,27 @@ def main():
         sel_deep_seen = []
         warmed = False
         for si, s in enumerate(samples):
-            qt = _PROMPT.format(q=s["question"])
+            docs = list(s["docs"])
+            docs[0] = chat_prefix + docs[0]
+            qt = _PROMPT.format(q=s["question"]) + chat_suffix
             golds = s["answers"]
-            full_text = "\n\n".join(s["docs"])
+            full_text = "".join(docs)
+            canonical_ids = _segmented_input_ids(tok, docs, qt)
+            canonical_ids_sha256 = hashlib.sha256(
+                b"".join(int(x).to_bytes(4, "little") for x in canonical_ids)
+            ).hexdigest()
+            segment_lengths = [
+                len(tok(doc, add_special_tokens=False)["input_ids"]) for doc in docs
+            ]
 
             # ── baseline: standard FA-2 prefill ──
-            tb, ttft_b, dec_b, n_ctx = standard_prefill(
-                model, tok, full_text, qt, MAX_NEW_TOKENS
+            logits_b, tb, ttft_b_quality, dec_b, n_ctx = standard_prefill(
+                model,
+                tok,
+                full_text,
+                qt,
+                MAX_NEW_TOKENS,
+                input_ids=canonical_ids,
             )
             ans_b = _short_ans(tb)
             gc.collect()
@@ -477,7 +640,13 @@ def main():
 
             # ── RedKnot head-class KV reuse ──
             segs = offline_prefill_segments(
-                model, tok, s["docs"], chunk_size=chunk_size, model_id=MODEL_PATH
+                model,
+                tok,
+                docs,
+                chunk_size=chunk_size,
+                model_id=MODEL_PATH,
+                capture_ffn_delta=True,
+                capture_attn_output=True,
             )
             if not warmed:
                 run_redknot_offlinekv(
@@ -490,11 +659,16 @@ def main():
                     kernel="fa3_parallel",
                     sparse_ffn_schedule=sched,
                     use_compile=USE_COMPILE,
+                    query_backend=QUERY_BACKEND,
+                    paged_skip_invisible=PAGED_SKIP_INVISIBLE,
+                    decode_first_token_from_headclass=True,
+                    query_local_full_scope=QUERY_LOCAL_FULL_SCOPE,
+                    reuse_local_attn_output=REUSE_LOCAL_ATTN_OUTPUT,
                 )
                 warmed = True
             stats = []
             t0 = time.perf_counter()
-            _, tc, _, ttft_c = run_redknot_offlinekv(
+            logits_c, tc, _, ttft_c_quality = run_redknot_offlinekv(
                 model,
                 tok,
                 segments_offline=segs,
@@ -505,15 +679,79 @@ def main():
                 sparse_ffn_schedule=sched,
                 sparse_ffn_stats=stats,
                 use_compile=USE_COMPILE,
+                query_backend=QUERY_BACKEND,
+                paged_skip_invisible=PAGED_SKIP_INVISIBLE,
+                decode_first_token_from_headclass=True,
+                query_local_full_scope=QUERY_LOCAL_FULL_SCOPE,
+                reuse_local_attn_output=REUSE_LOCAL_ATTN_OUTPUT,
             )
             torch.cuda.synchronize()
             tot_c = time.perf_counter() - t0
+
+            # Optional formal hot-TTFT protocol.  Quality generation above
+            # warms both paths once.  Extra warmups are symmetric, and the
+            # measured pairs alternate AB/BA so neither implementation always
+            # benefits from going second.  Offline artifact construction stays
+            # outside RedKnot online TTFT by definition.
+            base_ttfts = []
+            rk_ttfts = []
+
+            def time_base_once():
+                return standard_prefill(
+                    model, tok, full_text, qt, 1, input_ids=canonical_ids
+                )[2]
+
+            def time_rk_once():
+                return run_redknot_offlinekv(
+                    model,
+                    tok,
+                    segments_offline=segs,
+                    query_text=qt,
+                    head_cfg=hc,
+                    max_new_tokens=1,
+                    kernel="fa3_parallel",
+                    sparse_ffn_schedule=sched,
+                    use_compile=USE_COMPILE,
+                    query_backend=QUERY_BACKEND,
+                    paged_skip_invisible=PAGED_SKIP_INVISIBLE,
+                    decode_first_token_from_headclass=True,
+                    query_local_full_scope=QUERY_LOCAL_FULL_SCOPE,
+                    reuse_local_attn_output=REUSE_LOCAL_ATTN_OUTPUT,
+                )[3]
+
+            for wi in range(TTFT_WARMUP):
+                if wi % 2 == 0:
+                    time_base_once()
+                    time_rk_once()
+                else:
+                    time_rk_once()
+                    time_base_once()
+            for mi in range(TTFT_ITERS):
+                if mi % 2 == 0:
+                    base_ttfts.append(time_base_once())
+                    rk_ttfts.append(time_rk_once())
+                else:
+                    rk_ttfts.append(time_rk_once())
+                    base_ttfts.append(time_base_once())
+
+            if base_ttfts:
+                ttft_b = statistics.median(base_ttfts)
+                ttft_c = statistics.median(rk_ttfts)
+            else:
+                ttft_b = ttft_b_quality
+                ttft_c = ttft_c_quality
             ans_c = _short_ans(tc)
+            logits_cosine = torch.nn.functional.cosine_similarity(
+                logits_b.float(), logits_c.float(), dim=0
+            ).item()
+            top1_agreement = float(logits_b.argmax().item() == logits_c.argmax().item())
             n_dec = len(tok(tc, add_special_tokens=False)["input_ids"]) or 1
-            dec_c = n_dec / max(tot_c - ttft_c, 1e-3)
+            dec_c = n_dec / max(tot_c - ttft_c_quality, 1e-3)
             sp = [x for x in stats if x.get("mode") == "sparse"]
+            selected_frac_deep = None
             if sp:
-                sel_deep_seen.append(sum(x["selected_frac"] for x in sp) / len(sp))
+                selected_frac_deep = sum(x["selected_frac"] for x in sp) / len(sp)
+                sel_deep_seen.append(selected_frac_deep)
 
             rows.append(
                 {
@@ -523,23 +761,71 @@ def main():
                     "rk_em": em_score(ans_c, golds),
                     "base_ttft": ttft_b,
                     "rk_ttft": ttft_c,
+                    "base_ttft_quality_run": ttft_b_quality,
+                    "rk_ttft_quality_run": ttft_c_quality,
+                    "base_ttft_samples": base_ttfts,
+                    "rk_ttft_samples": rk_ttfts,
+                    "base_ttft_p50": ttft_b,
+                    "rk_ttft_p50": ttft_c,
+                    "base_ttft_p95": (
+                        _percentile(base_ttfts, 0.95) if base_ttfts else ttft_b
+                    ),
+                    "rk_ttft_p95": (
+                        _percentile(rk_ttfts, 0.95) if rk_ttfts else ttft_c
+                    ),
                     "base_dec": dec_b,
                     "rk_dec": dec_c,
                     "n_ctx": n_ctx,
+                    "logits_cosine": logits_cosine,
+                    "top1_agreement": top1_agreement,
+                    "ffn_selected_frac_deep": selected_frac_deep,
+                    "segment_lengths": segment_lengths,
                 }
             )
 
-            print(f"\n [sample {si}] ctx={n_ctx:,} tok")
+            all_cases.append(
+                {
+                    "dataset": name,
+                    "row_index": s["row_index"],
+                    "row_sha256": s["row_sha256"],
+                    "selection_key": s["selection_key"],
+                    "question": s["question"],
+                    "answers": golds,
+                    "context_tokens": n_ctx,
+                    "canonical_input_ids_sha256": canonical_ids_sha256,
+                    "baseline_output": tb,
+                    "redknot_output": tc,
+                    **rows[-1],
+                }
+            )
+
+            print(
+                f"\n [sample {si}] row={s['row_index']} "
+                f"sha256={s['row_sha256'][:12]} ctx={n_ctx:,} tok "
+                f"offline_chunks={len(segment_lengths)}"
+            )
             print(f"   Q   : {_trunc(s['question'], 80)}")
             print(f"   gold: {_trunc(str(golds[0]), 60)}")
             print(
                 f"   base: ans={_trunc(ans_b, 30)!r} F1={rows[-1]['base_f1']:.2f}  |  "
                 f"rk: ans={_trunc(ans_c, 30)!r} F1={rows[-1]['rk_f1']:.2f}"
             )
+            print(f"   base_full: {tb!r}")
+            print(f"   rk_full  : {tc!r}")
             print(
-                f"   TTFT: base={ttft_b:.2f}s  rk={ttft_c:.2f}s  "
+                f"   LOGITS: cosine={logits_cosine:.6f} "
+                f"top1_agreement={top1_agreement:.0f}"
+            )
+            print(
+                f"   TTFT: recomputed={ttft_b:.2f}s  rk={ttft_c:.2f}s  "
                 f"speedup={ttft_b / max(ttft_c, 1e-6):.2f}x"
             )
+            if base_ttfts:
+                print(
+                    f"         p95 recomputed={_percentile(base_ttfts, 0.95):.2f}s "
+                    f"rk={_percentile(rk_ttfts, 0.95):.2f}s "
+                    f"n={len(base_ttfts)}"
+                )
 
             del segs
             # The offline KV cache is a process-wide singleton: every segment's
@@ -554,12 +840,27 @@ def main():
             continue
 
         m = lambda k: sum(r[k] for r in rows) / len(rows)
-        sel_deep = sum(sel_deep_seen) / len(sel_deep_seen) if sel_deep_seen else 0.14
+        sparse_layer_count = sum(not sched.is_dense_layer(li) for li in range(d["L"]))
+        if sparse_layer_count == 0:
+            sel_deep = 1.0
+        elif sel_deep_seen:
+            sel_deep = sum(sel_deep_seen) / len(sel_deep_seen)
+        else:
+            raise RuntimeError("sparse FFN was configured but emitted no selection stats")
         avg_ctx = int(m("n_ctx"))
-        n_seg = max(1, -(-avg_ctx // SEG_TOKENS))  # ceil
-        seg_lens = [SEG_TOKENS] * (n_seg - 1) + [avg_ctx - SEG_TOKENS * (n_seg - 1)]
+        segment_shapes = {tuple(row["segment_lengths"]) for row in rows}
+        if len(segment_shapes) != 1:
+            raise RuntimeError(f"mixed offline segment geometry: {sorted(segment_shapes)}")
+        seg_lens = list(next(iter(segment_shapes)))
         fl = compute_flops(
-            d, seg_lens, frac_global, sel_deep, ffn_cfg["dense_until"], local_window
+            d,
+            seg_lens,
+            frac_global,
+            sel_deep,
+            ffn_cfg["dense_until"],
+            ffn_cfg.get("dense_suffix_layers", 0),
+            local_window,
+            REUSE_LOCAL_ATTN_OUTPUT,
         )
         P = 1e15
 
@@ -569,15 +870,28 @@ def main():
         print(f"   QUALITY   baseline  F1={m('base_f1'):.3f}  EM={m('base_em'):.3f}")
         print(f"             RedKnot   F1={m('rk_f1'):.3f}  EM={m('rk_em'):.3f}")
         print(
+            f"             logits cosine={m('logits_cosine'):.6f}  "
+            f"top1={m('top1_agreement'):.3f}"
+        )
+        print(
             f"   TTFT      baseline={m('base_ttft'):.2f}s  "
             f"RedKnot={m('rk_ttft'):.2f}s  "
             f"speedup={m('base_ttft') / max(m('rk_ttft'), 1e-6):.2f}x"
         )
+        if TTFT_ITERS:
+            print(
+                f"             p95 baseline={m('base_ttft_p95'):.2f}s  "
+                f"RedKnot={m('rk_ttft_p95'):.2f}s  "
+                f"paired_iters={TTFT_ITERS}"
+            )
         print(
             f"   DECODE    baseline={m('base_dec'):.1f} tok/s  "
             f"RedKnot={m('rk_dec'):.1f} tok/s"
         )
-        print(f"   COMPUTE (prefill FLOPs, P=1e15, local_window={local_window}):")
+        print(
+            "   COMPUTE (online prefill FLOPs; RedKnot excludes cached "
+            f"segment-0, P=1e15, local_window={local_window}):"
+        )
         for cn in ["attn", "ffn", "proj", "total"]:
             dn, hcv = fl[cn]
             sv = (1 - hcv / dn) * 100 if dn > 0 else 0.0
@@ -589,15 +903,58 @@ def main():
         overall[name] = {
             "base_f1": m("base_f1"),
             "rk_f1": m("rk_f1"),
+            "base_em": m("base_em"),
+            "rk_em": m("rk_em"),
+            "logits_cosine": m("logits_cosine"),
+            "top1_agreement": m("top1_agreement"),
             "base_ttft": m("base_ttft"),
             "rk_ttft": m("rk_ttft"),
             "flops_saving": (1 - fl["total"][1] / fl["total"][0]) * 100,
+            "ffn_selected_frac_deep": sel_deep,
+            "offline_chunks": len(seg_lens),
+            "offline_segment_lengths": seg_lens,
         }
 
     # final summary table
     print(f"\n{'=' * W}")
     print(" SUMMARY")
     print("=" * W)
+
+    if RESULT_OUT:
+        result_path = Path(RESULT_OUT)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            json.dumps(
+                {
+                    "format": "redknot_qwen3_rag_v1",
+                    "model": MODEL_PATH,
+                    "datasets": DATASETS,
+                    "selection_mode": SELECTION_MODE,
+                    "selection_seed": SEED,
+                    "max_ctx_tokens": MAX_CTX_TOKENS,
+                    "min_ctx_tokens": MIN_CTX_TOKENS,
+                    "segment_tokens": SEG_TOKENS,
+                    "compile": USE_COMPILE,
+                    "ttft_protocol": {
+                        "symmetric_warmup": TTFT_WARMUP,
+                        "paired_iters": TTFT_ITERS,
+                        "order": "AB/BA",
+                        "offline_artifact_time_included": False,
+                    },
+                    "query_local_full_scope": QUERY_LOCAL_FULL_SCOPE,
+                    "reuse_local_attn_output": REUSE_LOCAL_ATTN_OUTPUT,
+                    "query_backend": QUERY_BACKEND,
+                    "paged_skip_invisible": PAGED_SKIP_INVISIBLE,
+                    "overall": overall,
+                    "cases": all_cases,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f" result_json={result_path}")
     print(
         f" {'dataset':16s} {'base F1':>8s} {'rk F1':>7s} {'base TTFT':>10s} "
         f"{'rk TTFT':>9s} {'speedup':>8s} {'FLOPs save':>11s}"

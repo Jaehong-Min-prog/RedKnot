@@ -143,7 +143,13 @@ class RedKnotAttnBackend(AttentionBackend):
         if shared_kv_manager is not None:
             from sglang.srt.layers.attention.redknot.shared_kv import SharedKVBackend
 
-            self.shared_kv = SharedKVBackend(shared_kv_manager)
+            lifecycle = getattr(model_runner, "redknot_shared_kv_lifecycle", None)
+            if lifecycle is not None:
+                if lifecycle.backend.manager is not shared_kv_manager:
+                    raise ValueError("managed lifecycle/attention pool mismatch")
+                self.shared_kv = lifecycle.backend
+            else:
+                self.shared_kv = SharedKVBackend(shared_kv_manager)
         self._kernel_fn = (
             _resolve_kernel_fn(self.kernel_name) if self.shared_kv is None else None
         )

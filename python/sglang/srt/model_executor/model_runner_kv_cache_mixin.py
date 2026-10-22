@@ -381,7 +381,11 @@ class ModelRunnerKVCacheMixin:
             is_dsa_model, is_dsv4_model, current_platform
         )
 
-        if is_dsv4_model:
+        if getattr(self.server_args, "redknot_managed_kv", False):
+            from sglang.srt.mem_cache.head_kv.production import create_managed_token_pool
+
+            self.token_to_kv_pool = create_managed_token_pool(self)
+        elif is_dsv4_model:
             swa_page_size = self.page_size
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
@@ -898,6 +902,17 @@ class ModelRunnerKVCacheMixin:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
         self.max_running_requests = config.max_running_requests
+        if getattr(self.server_args, "redknot_managed_kv", False):
+            from sglang.srt.mem_cache.head_kv.production import prepare_managed_budget
+
+            prepare_managed_budget(self)
+            logger.info(
+                "Managed head KV logical tokens=%s, physical pages=%s, "
+                "tail/COW reserved token-equivalents=%s; no dense KV slab",
+                self.max_total_num_tokens,
+                self.redknot_managed_budget.capacity_pages,
+                self.redknot_managed_budget.reserved_tail_tokens,
+            )
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens

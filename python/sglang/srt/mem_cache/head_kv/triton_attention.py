@@ -4,11 +4,37 @@ One program computes one query/head/page partition. K/V are loaded directly
 from slab pages, with online softmax within partitions and a second reduction
 across partitions. This initial kernel targets decode and small repair/query
 batches, not high-throughput dense prefill.
+
+Visibility is resolved from logical positions before loading K/V. Empty blocks
+skip both payload reads and attention arithmetic; boundary blocks load only
+visible rows. Page metadata is still traversed, so this is not a compact-page
+planner or a change to the model's attention policy.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+
+def select_num_splits(num_pages, query_rows, requested=None):
+    """Bound long serial walks while keeping the FP32 merge workspace bounded.
+
+    The old occupancy-only choice gave one split to a 16-query repair batch,
+    even with thousands of pages per head. Mixed local/global batches then
+    waited on a small number of long global-head programs. Use finer page
+    partitions for long contexts, with at most 32K partial output records.
+    Explicit overrides are provided for numerical tests and controlled ablation.
+    """
+    if requested is not None:
+        if type(requested) is not int or not 1 <= requested <= 128:
+            raise ValueError("num_splits must be an integer in 1..128 or None")
+        return min(requested, max(1, num_pages))
+    row_count = max(1, query_rows)
+    page_partitions = max(1, triton.cdiv(num_pages, 8))
+    if num_pages < 128:
+        return min(page_partitions, min(32, max(1, triton.cdiv(256, row_count))))
+    workspace_limit = max(1, 32768 // row_count)
+    return min(128, workspace_limit, page_partitions)
 
 
 @triton.jit
@@ -26,7 +52,7 @@ def _head_paged_attention(
     DIM: tl.constexpr, PAGE_SIZE: tl.constexpr, NUM_PAGES: tl.constexpr,
     NUM_QUERIES: tl.constexpr, NUM_SPLITS: tl.constexpr, PAGES_PER_SPLIT: tl.constexpr,
     GROUP_SIZE: tl.constexpr, SCALE: tl.constexpr, CAUSAL: tl.constexpr,
-    BLOCK_D: tl.constexpr, BLOCK_B: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_B: tl.constexpr, SKIP_INVISIBLE: tl.constexpr,
 ):
     head = tl.program_id(0)
     query_idx = tl.program_id(1)
@@ -54,19 +80,27 @@ def _head_paged_attention(
                 if CAUSAL:
                     visible = visible & (positions <= query_pos)
                 visible = visible & ((window <= 0) | (positions >= query_pos - window + 1) | (positions < sink))
-                keys = tl.load(K + slot * k_s + offsets[:, None] * k_b + dims[None, :] * k_d,
-                               active[:, None] & (dims[None, :] < DIM), 0).to(tl.float32)
-                scores = tl.sum(keys * query[None, :], axis=1) * SCALE
-                scores = tl.where(visible, scores, -float("inf"))
-                new_max = tl.maximum(maximum, tl.max(scores, axis=0))
-                safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
-                old_weight = tl.exp(maximum - safe_max)
-                weights = tl.exp(scores - safe_max)
-                values = tl.load(V + slot * v_s + offsets[:, None] * v_b + dims[None, :] * v_d,
-                                 active[:, None] & (dims[None, :] < DIM), 0).to(tl.float32)
-                numerator = numerator * old_weight + tl.sum(weights[:, None] * values, axis=0)
-                denominator = denominator * old_weight + tl.sum(weights, axis=0)
-                maximum = new_max
+                # An empty block contributes (m=-inf, l=0, u=0). Skipping it
+                # preserves the online-softmax recurrence, including when an
+                # entire split is empty. Test actual positions rather than
+                # assuming physical/descriptor order is logical token order.
+                load_rows = active
+                if SKIP_INVISIBLE:
+                    load_rows = visible
+                if not SKIP_INVISIBLE or tl.sum(visible.to(tl.int32), 0) > 0:
+                    keys = tl.load(K + slot * k_s + offsets[:, None] * k_b + dims[None, :] * k_d,
+                                   load_rows[:, None] & (dims[None, :] < DIM), 0).to(tl.float32)
+                    scores = tl.sum(keys * query[None, :], axis=1) * SCALE
+                    scores = tl.where(visible, scores, -float("inf"))
+                    new_max = tl.maximum(maximum, tl.max(scores, axis=0))
+                    safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+                    old_weight = tl.exp(maximum - safe_max)
+                    weights = tl.exp(scores - safe_max)
+                    values = tl.load(V + slot * v_s + offsets[:, None] * v_b + dims[None, :] * v_d,
+                                     load_rows[:, None] & (dims[None, :] < DIM), 0).to(tl.float32)
+                    numerator = numerator * old_weight + tl.sum(weights[:, None] * values, axis=0)
+                    denominator = denominator * old_weight + tl.sum(weights, axis=0)
+                    maximum = new_max
     if NUM_SPLITS == 1:
         result = tl.where(denominator > 0, numerator / tl.maximum(denominator, 1.0e-30), 0.0)
         tl.store(OUT + head * out_h + query_idx * out_n + dims * out_d, result, dims < DIM)
@@ -104,6 +138,7 @@ def _merge_partitions(
 def triton_paged_attention(
     query, k_pool, v_pool, page_slots, page_lengths, key_positions,
     query_positions, windows, sinks, num_q_per_kv, scale, causal,
+    *, skip_invisible=True, num_splits=None,
 ):
     """Launch with *already validated* descriptors under a live caller read lease.
 
@@ -111,18 +146,19 @@ def triton_paged_attention(
     value checks. Mutating descriptors or reusing physical slots after validation
     invalidates its safety contract. Record a CUDA completion event before
     releasing the manager's read lease.
+
+    ``skip_invisible=False`` retains full payload traversal for controlled A/B
+    measurements, with the same split geometry as the optimized arm. Override
+    ``num_splits`` to measure partitioning separately from payload skipping.
     """
+    num_splits = select_num_splits(page_slots.shape[1], query.shape[0] * query.shape[1], num_splits)
     output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
     if query.shape[1] == 0:
         return output
     block_d = triton.next_power_of_2(query.shape[2])
     block_b = min(32, triton.next_power_of_2(k_pool.shape[1]))
-    # Long-context decode needs more parallelism than one CTA per query head.
-    # Partition only page traversal; the workspace contains O(Hq*Nq*splits*D)
-    # online-softmax statistics, never a gathered KV sequence or score matrix.
-    row_count = query.shape[0] * query.shape[1]
-    desired_splits = min(32, max(1, triton.cdiv(256, row_count)))
-    num_splits = min(desired_splits, max(1, triton.cdiv(page_slots.shape[1], 8)))
+    # Partition only page traversal. Workspace holds online-softmax statistics,
+    # never a gathered KV sequence or score matrix; its split count is bounded.
     pages_per_split = triton.cdiv(page_slots.shape[1], num_splits)
     partial = (torch.empty((query.shape[0], query.shape[1], num_splits, query.shape[2] + 2),
                            dtype=torch.float32, device=query.device)
@@ -136,7 +172,7 @@ def triton_paged_attention(
         *output.stride(),
         query.shape[2], k_pool.shape[1], page_slots.shape[1],
         query.shape[1], num_splits, pages_per_split,
-        num_q_per_kv, scale, causal, block_d, block_b,
+        num_q_per_kv, scale, causal, block_d, block_b, skip_invisible,
         num_warps=4 if block_b * block_d <= 8192 else 8,
     )
     if num_splits > 1:

@@ -371,6 +371,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional per-step HeadClassConfig override. Leave unset to use the
     # one bound to the backend at server start.
     redknot_head_config: Optional[object] = None
+    # Eager same-process lifecycle only; never serialize GPU ownership using
+    # user request IDs or recycled scheduler pool slots.
+    redknot_shared_kv_handles: Optional[List[object]] = None
     # RedKnot DSV4 offline MLA reuse plan (demo). A dict describing whether the
     # current single-request forward should snapshot a segment's rope KV or
     # relocate cached segment KV into the request's global positions. See
@@ -737,6 +740,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        managed_lifecycle = getattr(model_runner, "redknot_shared_kv_lifecycle", None)
+        if managed_lifecycle is not None:
+            managed_lifecycle.bind_batch(batch, ret)
 
         return ret
 

@@ -565,6 +565,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    # Finish, abort and decode retraction all converge here. Drop managed roots
+    # before recycling logical token/request slots; CUDA event retirement stays
+    # with HeadPagePool. Disabled paths do not import the managed implementation.
+    if getattr(req, "_redknot_managed_binding", None) is not None:
+        from sglang.srt.mem_cache.head_kv.production import release_managed_request
+
+        release_managed_request(req)
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (

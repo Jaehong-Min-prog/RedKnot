@@ -553,25 +553,33 @@ def _switch_attn_impl(model, impl: str):
     """
     base = model.model if hasattr(model, "model") else model
     orig = {}
+    configs = []
+    # HF attention layers commonly alias model.config. Capture *all* values
+    # before any mutation, otherwise later layers and _model save the temporary
+    # implementation and restoration leaks it into subsequent benchmark arms.
     for li, layer in enumerate(base.layers):
         attn = layer.self_attn
         if hasattr(attn, "config"):
             orig[li] = getattr(attn.config, "_attn_implementation", "eager")
-            attn.config._attn_implementation = impl
+            configs.append(attn.config)
     if hasattr(model, "config"):
         orig["_model"] = getattr(model.config, "_attn_implementation", None)
-        model.config._attn_implementation = impl
+        configs.append(model.config)
+    for config in configs:
+        config._attn_implementation = impl
     return orig
 
 
 def _restore_attn_impl(model, orig):
     base = model.model if hasattr(model, "model") else model
+    # Restore the parent first: a composite config setter may propagate to its
+    # children, whose original per-layer implementations can be heterogeneous.
+    if "_model" in orig and hasattr(model, "config"):
+        model.config._attn_implementation = orig["_model"]
     for li, layer in enumerate(base.layers):
         attn = layer.self_attn
         if hasattr(attn, "config") and li in orig:
             attn.config._attn_implementation = orig[li]
-    if "_model" in orig and hasattr(model, "config"):
-        model.config._attn_implementation = orig["_model"]
 
 
 @torch.no_grad()

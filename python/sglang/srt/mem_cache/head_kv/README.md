@@ -1,293 +1,255 @@
-# Head-paged KV ownership and sharing
+# Head-paged KV management and SegPagedAttention
 
-This package implements an experimental bounded MHA/GQA KV manager and a
-direct paged attention backend. Pages belong to physical KV heads/groups,
-not to query heads. The existing RedKnot `segpaged_attention` entry point
-dispatches to this backend when given `ManagedSegPagedKVCache`. The regular
-`RedKnotAttnBackend` and `SegPagedAttnBackend` also expose an explicit shared
-request path for both prefill/extend and decode.
+This package provides bounded page ownership, head-level copy-on-write (COW),
+and direct paged attention for MHA/GQA models. Physical pages belong to KV heads
+or GQA groups. Query heads that share a KV group do not receive duplicate pages.
 
-## Ownership and mutation
+Three integrations have different scopes:
 
-* A request owns an immutable version of its segment table. A segment is
-  addressed by `(layer, kv_head, occurrence)` and records target logical
-  positions (not compacted storage offsets) and adapter-supplied provenance.
-* Forks and arbitrary segment occurrences can reference the same sealed
-  physical pages. Sharing is not restricted to prefixes. A partial repair
-  reserves only touched pages; a full-page rewrite copies no old rows.
-  Multi-page repairs batch row gathering/scattering across all touched
-  pages, avoiding one set of GPU launches per page. Temporary payloads
-  contain only touched retained rows and compact repair rows.
-* Every published page, including a partial tail, is immutable. Append
-  detaches a partial tail and retains full historical pages. Repeated
-  occurrences in one root have one physical owner reference per page.
-* Multi-head updates validate and reserve their entire destination set
-  before copying. An OOM does not partially change the request root.
-  A write transaction publishes only after its completion event and only
-  if the request generation and version still match.
-* Read leases pin a complete version until the consumer's CUDA event.
-  Owner references, reader pins and pending device events are separate.
-  Event failures quarantine the pool; expiry of a network lease does not
-  imply that a GPU page can be overwritten.
+| Integration | Entry point | Current scope |
+| --- | --- | --- |
+| Attention adapter | `SharedKVBackend`, `ManagedSegPagedKVCache` | Caller-managed handles and eager attention calls |
+| Native request lifecycle | `--redknot-managed-kv` | Opt-in single-GPU Qwen3 live serving |
+| Non-prefix experiment | `NonPrefixPagedEngine`, `run_queued` | Standalone Qwen3 document reuse and admission scheduling |
 
-The pool allocates fixed K/V slabs `[capacity_pages, page_size, head_dim]`.
-`allocated_bytes` counts active page capacity; `reserved_slab_bytes` is the
-actual fixed backing allocation. Forking saves page admission capacity
-without shrinking an already allocated CUDA slab.
+The non-prefix experimental scheduler and cross-process snapshot protocol are
+separate from the native request lifecycle. Enabling the native flag does not
+enable non-prefix import or distributed serving.
+
+## Ownership, publication, and retirement
+
+A request owns an immutable segment-table version. Each segment is addressed by
+`(layer, kv_head, occurrence)` and records physical page references, logical token
+positions, position basis, and adapter-supplied provenance.
+
+- Forks and repeated segment occurrences can share sealed pages. Each request
+  root owns a physical page once even when it contains several references.
+- Writes and repairs validate and reserve the complete destination set before
+  copying. Repairs detach only touched pages; a full-page rewrite copies no old
+  rows. Append retains complete historical pages and detaches a partial tail.
+- A write transaction publishes after its device completion event, provided the
+  request generation and table epoch still match. A failed reservation leaves
+  the committed root unchanged.
+- Read leases pin a table version through the consumer's completion event.
+  Owner references, reader pins, and outstanding device events are tracked
+  separately. An event failure quarantines the pool.
+- Retirement visits event-bearing pages and reclaimable orphans rather than
+  scanning all live immutable pages. Event queries are deduplicated within a
+  collection pass. `collection_stats()` reports this host-side work separately.
+
+The pool uses fixed K/V slabs of shape
+`[capacity_pages, page_size, head_dim]`. `allocated_bytes` reports capacity
+occupied by active pages; `reserved_slab_bytes` reports the backing allocation.
+Sharing can admit more requests into that slab without reducing the slab's
+already allocated CUDA memory.
 
 ```python
 import torch
-from sglang.srt.mem_cache.head_kv import HeadKVManager, HeadPagePool
-from sglang.srt.mem_cache.head_kv.manager import SegmentWrite, SegmentPatch
+from sglang.srt.mem_cache.head_kv import (
+    HeadKVManager, HeadPagePool, SegmentPatch, SegmentWrite,
+)
 
 pool = HeadPagePool(128, 16, 128, dtype=torch.bfloat16, device="cuda")
 manager = HeadKVManager(pool)
-manager.create_request("parent", context_id="context-hash",
-                       contract="my-model-and-layout-v1", namespace="tenant-a")
+manager.create_request(
+    "parent", context_id="context-hash",
+    contract="weights-adapters-kv-layout-position-v1", namespace="tenant-a",
+)
+key = (0, 0, "document-0")
 k = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
 v = torch.randn_like(k)
-key = (0, 0, "document-occurrence-0")
-manager.update("parent", writes=[SegmentWrite(
-    key, k, v, tuple(range(32)), "adapter-state-hash")])
+manager.update("parent", writes=[
+    SegmentWrite(key, k, v, tuple(range(32)), "adapter-state-hash"),
+])
 manager.fork("parent", "child")
-manager.update("child", patches=[SegmentPatch(
-    key, (19,), k[:1], v[:1], "repaired-state-hash")])
+manager.update("child", patches=[
+    SegmentPatch(key, (19,), k[:1], v[:1], "repaired-state-hash"),
+])
 manager.release_request("child")
 manager.release_request("parent")
-pool.collect()
+pool.collect()  # In-flight events can defer physical reclamation.
 ```
 
-Adapters must pass their model's actual namespace and compatibility contract.
-The strings in this example are placeholders, not computed validity proofs.
+The example's contract, context, and provenance strings are placeholders. The
+model adapter supplies their actual identities and validates any repair inputs.
 
-## Attention
+## Bulk document aliases and writes
 
-`ReadLease.descriptor(layer, num_kv_heads)` provides page slots, extents and
-logical positions. `paged_attention` reads the slabs directly, with GQA
-mapping, per-head windows/sinks, causal masking and online softmax across
-pages. It does not concatenate the historical KV sequence. `gather` exists
-only as an explicit reference/export helper.
+`share_segments_many(target_id, sources, expected_epoch=...,
+expected_sources=...)` publishes aliases from several committed source roots
+with one target-table transition. Each source entry is
+`(source_id, shares[, source_is_cache])`; each share is
+`(source_key, target_key, ReuseProof[, positions])`.
 
-The Triton kernel accumulates QK, softmax and PV in FP32 before casting the
-output. Different low-precision attention backends can round intermediate
-values differently; model-level comparisons must report both logit error
-and token agreement. The public API validates descriptors (including a CPU
-sync on CUDA). This initial implementation targets correctness, decode and
-small query batches, not optimized dense prefill or production throughput.
+All source contracts, namespaces, positions, proofs, and destination keys are
+validated before ownership changes. Exact root identities in
+`expected_sources[(source_id, source_is_cache)]` prevent an intervening rewrite
+or eviction from silently rebinding the alias. Destination publication retains
+added pages and releases removed pages without copying KV payloads.
 
-## RedKnot and SegPaged backend integration
+`metadata_snapshots(source_ids, source_is_cache=False)` captures immutable roots
+for CPU metadata inspection. These snapshots do not pin pages or authorize GPU
+reads. A metadata-only alias publisher must pass the captured roots back through
+`expected_sources`; tensor consumers use `bind()` read leases.
 
-The registered `redknot` and `segpaged` backends accept a caller-owned manager.
-Set `runner.redknot_shared_kv_manager` **before backend construction**; the
-registry passes it into `RedKnotAttnBackend` or `SegPagedAttnBackend`. Direct
-construction accepts `shared_kv_manager=manager` as well. This is an opt-in
-integration API, not a new command-line switch or automatic scheduler setup.
+`update(..., batched_writes=True)` batches full-segment payload writes. Contiguous
+destination slots use slab slices; fragmented slots use indexed copies. Patch
+semantics, immutable publication, and event retirement remain the same.
+`append_many` appends one request's heads in one transaction.
 
-```python
-import torch
-from sglang.srt.layers.attention.attention_registry import create_redknot_backend
-from sglang.srt.mem_cache.head_kv import HeadKVManager, HeadPagePool
+Atomicity covers a manager transaction, not an entire model forward or batch.
+After a later layer or request fails, the caller must discard affected partial
+requests before retrying.
 
-# runner is an existing, configured ModelRunner. Choose capacity for the
-# physical KV heads of all participating local layers, with room for COW.
-pool = HeadPagePool(4096, 16, 128, dtype=torch.float32, device=runner.device)
-runner.redknot_shared_kv_manager = HeadKVManager(pool)
-backend = create_redknot_backend(runner)
-# create_segpaged_backend(runner) selects the same ownership adapter.
-shared = backend.shared_kv
-```
+## Attention and adapter contracts
 
-The pool dtype/device and equal Q/K/V head dimension must match the actual
-model tensors. The FP32 example reflects the currently qualified model
-comparison; BF16 model qualification remains incomplete as described below.
-The contract must identify weights, adapters, KV representation and position
-semantics. The namespace is the isolation domain, and the context ID identifies
-the already-computed context. These values are supplied by the integration;
-the backend does not derive them from a token-pool slot.
+`ReadLease.descriptor(layer, num_kv_heads)` produces page slots, extents, and
+logical positions. `paged_attention` reads the slabs directly with GQA mapping,
+causal masking, per-head windows/sinks, and online softmax across pages.
+`gather()` is an explicit reference/export helper.
 
-The following illustrates the lifecycle at the attention boundary. `layer`,
-projected Q/K/V, and prefill/decode batches come from the model's existing
-forward loop. Apply the same request handles to every participating model
-layer, and complete the parent's model prefill before forking it.
+The Triton backend accumulates QK, softmax, and PV in FP32. It skips invisible
+payload blocks while preserving the selected attention policy. Split counts
+bound long page walks and partial-output workspace. The
+`skip_invisible=False` and `num_splits=...` options support controlled ablations.
+Public descriptor validation can synchronize CUDA; this implementation targets
+decode and small query batches rather than high-throughput full prefill.
 
-```python
-parent = shared.create_request(
-    "request-parent", context_id="canonical-context-identity",
-    contract="weights-adapters-kv-position-contract", namespace="tenant-a",
-)
-handles_to_release = [parent]
-try:
-    prefill_batch.redknot_shared_kv_handles = [parent]
-    # Run for each layer as its Q/K/V become available. They already include
-    # the model's position transform. Batch metadata supplies explicit positions.
-    backend.init_forward_metadata(prefill_batch)
-    prefill_output = backend.forward_extend(
-        q, k, v, layer, prefill_batch, save_kv_cache=True,
-    )
+The registered `redknot` and `segpaged` backends accept a caller-owned
+`runner.redknot_shared_kv_manager` set before backend construction. Their shared
+adapter uses generation-fenced request handles and receives one handle per
+request in `ForwardBatch.redknot_shared_kv_handles`. Positions and prefix lengths
+must describe each request's actual causal history. Every layer uses the same
+request handle, and every completion, cancellation, or failure releases it.
 
-    # After all parent layers finish: both children share its immutable pages.
-    left = shared.fork_request(parent, "request-left")
-    handles_to_release.append(left)
-    right = shared.fork_request(parent, "request-right")
-    handles_to_release.append(right)
-    decode_batch.redknot_shared_kv_handles = [left, right]
-    # Q/K/V contain one new token for each request in this same order.
-    backend.init_forward_metadata(decode_batch)
-    decode_output = backend.forward_decode(
-        q_decode, k_decode, v_decode, layer, decode_batch, save_kv_cache=True,
-    )
-    # Later appends or shared.repair_request(handle, patches) detach only
-    # changed pages. Repairs require model-correct upstream inputs.
-finally:
-    # The scheduler invokes release for completion, cancellation and errors.
-    for handle in reversed(handles_to_release):
-        shared.release_request(handle)
-    pool.collect()  # In-flight reader events can defer physical reclamation.
-```
+That low-level adapter alone does not replace the scheduler's original KV
+allocation. Integrations must coordinate memory allocation and request lifetime
+explicitly. It rejects unsupported graph, speculative, quantized-KV,
+cross-attention, multiaxis-position, and incompatible-head-dimension paths.
 
-A `SharedKVRequestHandle` contains the stable request ID and its generation.
-Recreating an ID cannot make an old handle valid. A fork preserves the parent's
-context/contract/namespace; it does not authorize reuse for an unrelated prompt.
-A batch must carry exactly one distinct live handle per request, in token order.
-Extend uses `positions`, `extend_seq_lens`, `extend_prefix_lens` and `seq_lens`;
-decode uses one token per handle, `positions` and `seq_lens`. Every layer/head
-must already cover its complete declared prefix. The adapter neither imports
-an absent dense-cache prefix nor silently creates a request.
+## Opt-in native request lifecycle
 
-The registered backend dispatches this path before dense KV reads/writes.
-It stores one persistent `__redknot_live__` segment per physical KV head/layer,
-atomically appends that request's heads with `append_many`, and reads them via
-`ManagedSegPagedKVCache` page descriptors. It never expands GQA KV into query
-heads or gathers full historical KV. Local/global/dense head policies and
-model scaling are preserved. The model's sliding window further restricts a
-head window; sink policies that would expand a model sliding window are rejected.
-Retrieval policies, legacy dense `redknot_offline_segments` splice plans and
-extra model attention keyword arguments with non-`None` values are rejected.
+`production.py` connects managed handles to real SGLang `Req` objects and
+`ForwardBatch` construction. Completion, abort, and retraction release request
+roots before logical request/token slots are recycled. Flush verifies that no
+managed requests remain. Weight updates require a serving restart.
 
-This adapter requires eager execution and explicit lifecycle wiring. It rejects
-unsupported cross-attention, encoder/bidirectional attention, speculative trees,
-multiaxis positions, quantized/scaled KV, logit capping, unequal Q/K/V dimensions
-and graph capture/replay paths. Supplying handles to an unconfigured backend also
-fails instead of falling through to dense execution.
+This integration allocates one physical head-page pool and a logical token
+accounting facade instead of an additional ordinary K/V slab. Its budget reserves
+request-tail fragmentation and COW scratch space. Logical admission charges each
+request's whole sequence; it does not assume sharing when admitting requests.
 
-An append is atomic across one request's physical heads in one layer. Entire
-batches and model forwards are **not** transactions: a later OOM or kernel error
-can occur after earlier requests/layers committed. The caller must abort affected
-requests or restore a checkpoint before retrying; validation failures detected
-by the adapter's whole-batch preflight occur before its first append.
+The supported configuration is unquantized, full-layer Qwen3 MHA/GQA on one CUDA
+GPU with FP16/BF16 KV, `redknot` attention, FCFS, `page_size=1`, and an explicit
+positive `redknot_page_size`. Radix caching, overlap scheduling, and both CUDA
+graph modes must be disabled. TP/PP/DP, non-prefix import, LoRA, speculative
+decoding, and hybrid/MLA models are rejected. The eager step boundary synchronizes
+the current CUDA stream before collecting retired pages and admitting more work.
 
-The existing scheduler still needs to allocate/admit requests, attach the right
-handles, fork only valid contexts, retire requests and coordinate other model
-state. It can still allocate its original dense KV slab even when these attention
-calls bypass it. Therefore pool admission savings are not evidence of an
-end-to-end serving memory reduction until that allocation and lifecycle are
-integrated and measured.
-
-## Cross-process sharing
-
-`distributed.py` implements an HTTP owner and durable SQLite authority;
-`transfer.py` connects it to real page tensors:
-
-1. `export_snapshot` pins a request, stages page bytes on the host and puts
-   content-addressed immutable objects at the owner. It publishes a manifest
-   through a durable PREPARED/COMMITTED decision.
-2. `import_snapshot` acquires and renews a retention grant, checks the
-   manifest and compatibility contract, reserves all destination pages,
-   verifies payload digests/layouts and copies into the local pool.
-3. Only a fully received snapshot whose device copies completed becomes
-   visible. Cancellation, malformed payloads and OOM leave the destination
-   unpublished. Imported pages then use the normal local COW protocol.
-4. Grants and active transfers prevent owner-side collection. Publication
-   intents and request migration decisions are durable and idempotent.
-   Prepared intents require explicit resolution; their expiry cannot
-   silently discard an unresolved decision.
-
-```python
-from sglang.srt.mem_cache.head_kv.distributed import (
-    KVShareStore, KVShareServer, KVShareClient,
-)
-from sglang.srt.mem_cache.head_kv.transfer import export_snapshot, import_snapshot
-
-store = KVShareStore("/path/to/durable-owner", "tenant-a", capacity_bytes=1 << 30)
-with KVShareServer(store) as owner:
-    client = KVShareClient(owner.url, "tenant-a")
-    manifest = export_snapshot(source_manager, "source", client,
-                               operation_id="unique-publication-id")
-    # Destination must be empty and have matching namespace/context/contract.
-    import_snapshot(destination_manager, "destination", client, manifest,
-                    holder="destination-worker")
-store.close()
-```
-
-Use a new operation ID for a new publication. Retries of one operation keep
-the same ID. Non-loopback listeners require an authentication token; the
-transport is plaintext HTTP and needs a trusted network or an authenticated
-TLS tunnel/proxy. The token does not attest the mathematical validity of KV.
-
-RPC/metadata/object/in-flight budgets are enforced. A snapshot currently
-supports up to 4096 unique objects, 16384 descriptor page references and
-4 million logical positions; metadata is limited to 768 KiB within a 1 MiB
-RPC. Logical positions use arithmetic runs. This is a bounded initial
-protocol, not an unlimited long-context checkpoint format.
-
-The authority also provides prepare/ready/commit-or-abort migration,
-epoch fencing and exactly-once output-frontier advancement. Readiness is
-an adapter attestation: the serving adapter must ensure all required GPU
-and parallel ranks are ready before acknowledging it. A timeout does not
-authorize a second request owner. The authority is one process with a
-durable local database, not a replicated consensus service.
-
-## Validity and integration boundaries
-
-Sharing and COW preserve bytes and isolation; they do not establish that
-those bytes are correct for a new prompt. Exact reuse requires the same
-declared context and positions. Cross-context reuse requires an explicit
-trusted adapter certificate/policy, and approximation lineage must remain
-visible after further copies. Provenance/certificates are trusted adapter
-attestations, not cryptographic or automatically derived model proofs.
-
-The model adapter still owns cross-layer invalidation, repair inputs, head
-policy selection, position transforms and quality validation. Relocating
-position-encoded keys without a materialized adapter transform is rejected.
-This package does not treat MLA latent state or recurrent/native bundles
-as independent query-head KV pages.
-
-This change provides managed SegPaged attention and opt-in paths in both
-registered RedKnot/SegPaged backends. It does not automatically replace the
-SGLang scheduler's existing request/KV pools. It does
-not yet implement TP/CP/PP serving integration, scheduler-wide atomic
-model steps, RDMA/GPU-direct transfer, authority replication/failover,
-quantized-page mutation, or an MLA-specific backend. The Qwen3 validation
-uses an explicit model-instance adapter to exercise real weights.
-
-## Validation commands
-
-From the repository root, with PyTorch and pytest installed:
+The native smoke runner constructs these options and checks launched-server
+lifecycle behavior. Run it in a compatible SGLang CUDA environment:
 
 ```bash
-python -m pytest -q test/srt/redknot/test_head_kv_manager.py \
-  test/srt/redknot/test_head_kv_attention.py \
-  test/srt/redknot/test_head_kv_distributed.py \
-  test/srt/redknot/test_head_kv_transfer.py \
-  test/srt/redknot/test_shared_kv_adapter.py \
-  test/srt/redknot/test_shared_kv_backend.py
-python test/srt/redknot/benchmark_head_kv_manager.py \
-  --device cuda:0 --dtype bfloat16 --output benchmark.json
-python test/srt/redknot/validate_head_kv_qwen3.py \
-  --model-path /path/to/Qwen3-8B --device cuda --dtype bfloat16 \
-  --output qwen3.json
+python test/srt/redknot/run_managed_kv_native_smoke.py \
+  --model-path /path/to/local/Qwen3 \
+  --output /path/to/new-smoke-results
 ```
 
-Tests cover local ownership/COW/events, direct attention, real HTTP
-transfers and faults, restart decisions, migration fencing and snapshot
-validation. The shared-backend suites exercise registered entry-point dispatch,
-chunked prefill, batched fork/decode, generation fencing, local repair, window
-semantics, atomic multi-head admission and fail-closed unsupported inputs. Benchmarks distinguish raw samples, page capacity, reserved
-GPU memory and latency; the dense Torch attention reference is not an
-optimized FlashAttention throughput baseline.
+This is a validation command, not a throughput or task-quality claim.
 
-Initial real Qwen3-8B qualification passes the strict FP32 comparison.
-BF16 does **not** yet pass strict all-position token agreement, either
-against HF eager or the separately declared dense FP32-accumulation oracle.
-The original failures and their different rounding semantics must remain
-visible; a successful cache-isolation test is not BF16 model qualification.
+## Non-prefix reuse and admission experiments
+
+`layers/attention/redknot/nonprefix_paged.py` implements a separate single-GPU
+Hugging Face Qwen3 engine. Documents are computed independently at position zero.
+Canonical local-head KV pages are immutable and shared across occurrences;
+context-dependent global-head history is recovered privately online.
+Occurrence-specific query counterrotation aligns canonical RoPE coordinates
+without rewriting the shared keys. Position alignment does not establish that
+cross-context reuse is exact.
+
+The engine preserves the head policy during attention, builds page-aligned
+historical partitions, copies leading partial-page boundaries when needed by
+FlashAttention, and merges partition outputs using their log-sum-exp statistics.
+Each request retains a historical read lease and a private append arena for its
+query and generated suffix. Optional selective recovery is approximate and has
+separate configuration and quality checks.
+
+`nonprefix_scheduler.py` implements a single-owner queued service loop with
+bounded active requests, timed admission/recovery, query-length buckets, batched
+decode, cancellation, and cleanup. `nonprefix_affinity.py` offers admission
+ordering based on visible canonical page overlap, with lookahead, age, and bypass
+limits. Canonical documents remain resident; overlap measures locality, not
+saved allocations or an eviction hit rate. Recovery/admission is serialized.
+These modules do not route requests between nodes or install affinity into the
+native SGLang scheduler.
+
+Use the benchmark entry points to prepare frozen requests and compare service
+arms with the same tokens and declared memory budget:
+
+```bash
+python test/srt/redknot/benchmark_redknot_nonprefix.py --help
+python test/srt/redknot/benchmark_nonprefix_affinity.py --help
+python test/srt/redknot/benchmark_cow_sharing.py --help
+```
+
+## Cross-process snapshots
+
+`distributed.py` provides an HTTP object owner and durable SQLite authority;
+`transfer.py` exports and imports real page payloads. Exports pin snapshots and
+publish content-addressed objects through durable PREPARED/COMMITTED decisions.
+Imports validate compatibility, layout, extents, and payload digests, reserve all
+destination pages, and publish only after copies complete. Retention grants and
+active transfers prevent premature owner-side collection.
+
+Migration decisions include epoch fencing and output-frontier tracking.
+Readiness is an adapter attestation; an integration must coordinate all required
+GPU ranks before acknowledging it. This is a bounded transfer protocol with one
+durable owner, not a completed TP/CP/PP serving path, replicated authority, or
+GPU-direct/RDMA implementation. See module API docstrings for protocol budgets
+and listener authentication requirements.
+
+## Validation and measurement
+
+From the repository root, use the project's matching PyTorch and pytest
+environment. The following suites cover ownership, retirement, aliases, attention,
+and integration contracts; CUDA-marked cases need a compatible GPU stack:
+
+```bash
+python -m pytest -q \
+  test/srt/redknot/test_head_kv_manager.py \
+  test/srt/redknot/test_head_kv_retirement.py \
+  test/srt/redknot/test_head_kv_attention.py \
+  test/srt/redknot/test_metadata_alias_snapshots.py \
+  test/srt/redknot/test_nonprefix_multidoc_publish.py \
+  test/srt/redknot/test_nonprefix_scheduler.py \
+  test/srt/redknot/test_nonprefix_affinity.py \
+  test/srt/redknot/test_managed_kv_production.py
+```
+
+Report full recomputation, private-copy reuse, and shared-page reuse as distinct
+arms. Count offline document creation separately from hot online service, and
+include admission, recovery, publication, first-token computation, and release
+where the metric requires them. Report active page occupancy separately from
+reserved slab memory and total GPU memory.
+
+In `run_redknot_offlinekv`, emitted TTFT ends after the Phase E full-attention
+seed actually produces the first output token. Phase D head-class query logits
+remain diagnostic and can differ from that seed; their readiness time is
+recorded separately in `timing_stats`. The optional managed query bridge changes
+only Phase D, so output-text agreement alone does not validate it.
+`benchmark_segpaged_workflow.py` reports a serial request rate, not concurrent
+serving QPS. Concurrent benchmarks report both arrival-inclusive TTFT and service
+TTFT with their declared admission boundary.
+
+Low-precision backends can round differently. The non-prefix FlashAttention
+partition merge currently uses CUDA FP32 `index_add_` reductions, whose summation
+order can vary; bit-identical repeated outputs are not guaranteed. Record task
+quality, generated texts, and numerical comparisons rather than inferring one
+from another. Repeated prefixes/arrivals around the same question are not
+independent QA samples.
+
+Sharing, COW, provenance, and validity certificates preserve storage and declared
+lineage. They do not prove task accuracy or make arbitrary prompts equivalent.
+The model adapter remains responsible for context compatibility, position
+transforms, head classification, and recovery quality. MLA latents and recurrent
+states require representation-specific adapters.

@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import torch
 
@@ -103,11 +103,33 @@ class SparseFFNSchedule:
     mass_thresh_deep: Optional[float] = None
     recent_n: int = 128
     min_keep: int = 1
+    total_layers: int = 0
+    dense_suffix_layers: int = 0
+
+    def __post_init__(self) -> None:
+        if self.dense_until < 0:
+            raise ValueError("dense_until must be non-negative")
+        if self.dense_suffix_layers < 0:
+            raise ValueError("dense_suffix_layers must be non-negative")
+        if self.dense_suffix_layers and self.total_layers <= 0:
+            raise ValueError("dense suffix requires a positive total_layers")
+        if self.dense_until + self.dense_suffix_layers > self.total_layers > 0:
+            raise ValueError("dense FFN prefix/suffix layers overlap")
+
+    def is_dense_suffix_layer(self, layer_idx: int) -> bool:
+        return bool(
+            self.dense_suffix_layers
+            and layer_idx >= self.total_layers - self.dense_suffix_layers
+        )
 
     def is_dense_layer(self, layer_idx: int) -> bool:
         """True if this layer must run the full dense FFN (no sparsity)."""
         mt = self.get_mass_thresh(layer_idx)
-        return layer_idx < self.dense_until or mt >= 1.0
+        return (
+            layer_idx < self.dense_until
+            or self.is_dense_suffix_layer(layer_idx)
+            or mt >= 1.0
+        )
 
     def get_mass_thresh(self, layer_idx: int) -> float:
         """Return the effective mass threshold for ``layer_idx``.
@@ -117,7 +139,7 @@ class SparseFFNSchedule:
         - Deep layers (>= deep_layer_start): returns ``mass_thresh_deep``
           if set, otherwise ``mass_thresh``.
         """
-        if layer_idx < self.dense_until:
+        if layer_idx < self.dense_until or self.is_dense_suffix_layer(layer_idx):
             return 1.0  # dense
         if self.mass_thresh_deep is not None and layer_idx >= self.deep_layer_start:
             return self.mass_thresh_deep
@@ -448,6 +470,8 @@ def apply_sparse_ffn(
     schedule: SparseFFNSchedule,
     attn_out: Optional[torch.Tensor] = None,
     importance: Optional[torch.Tensor] = None,
+    segment_lengths: Optional[Sequence[int]] = None,
+    fallback_delta: Optional[torch.Tensor] = None,
     return_stats: bool = False,
 ):
     """Run ``X_next = Y + Z`` with token-selective FFN (Algorithm 1 21-23).
@@ -507,16 +531,49 @@ def apply_sparse_ffn(
             )
         importance = token_importance_from_attn(attn_out)
     layer_mt = schedule.get_mass_thresh(layer_idx)
-    keep = select_important_tokens(
-        importance, schedule, mass_thresh_override=layer_mt
-    )  # [B, L] bool
+    if segment_lengths is None:
+        keep = select_important_tokens(
+            importance, schedule, mass_thresh_override=layer_mt
+        )  # [B, L] bool
+    else:
+        if B != 1:
+            raise ValueError("segmentwise FFN selection requires batch size one")
+        lengths = tuple(int(x) for x in segment_lengths)
+        if any(x <= 0 for x in lengths) or sum(lengths) != L:
+            raise ValueError("segment_lengths must be positive and tile L exactly")
+        # Each RAG document receives its own attention-mass budget and recent
+        # guard.  The masks are concatenated first, then all selected rows are
+        # executed by the same packed FFN call below; this fixes cross-document
+        # starvation without reintroducing one tiny GEMM per document.
+        parts = []
+        start = 0
+        for length in lengths:
+            end = start + length
+            parts.append(
+                select_important_tokens(
+                    importance[:, start:end],
+                    schedule,
+                    mass_thresh_override=layer_mt,
+                )
+            )
+            start = end
+        keep = torch.cat(parts, dim=1)
 
     # ── Pack selected rows, run dense FFN once (line 21). ──
     flat_hidden = hidden_states.reshape(B * L, E)
     flat_keep = keep.reshape(B * L)
     sel_idx = torch.nonzero(flat_keep, as_tuple=False).flatten()
 
-    z_full = torch.zeros_like(flat_hidden)  # line 22: residual identity (Z=0)
+    if fallback_delta is None:
+        z_full = torch.zeros_like(flat_hidden)  # legacy residual identity
+    else:
+        if fallback_delta.shape != hidden_states.shape:
+            raise ValueError("fallback_delta must match hidden_states exactly")
+        if fallback_delta.device != hidden_states.device:
+            raise ValueError("fallback_delta must already be on the execution device")
+        # Immutable offline deltas seed unselected rows. Selected rows are
+        # overwritten below with freshly recomputed FFN outputs.
+        z_full = fallback_delta.reshape(B * L, E).clone()
     if sel_idx.numel() > 0:
         sel_hidden = flat_hidden.index_select(0, sel_idx)  # [N_sel, E]
         sel_z = ffn(sel_hidden)
@@ -538,6 +595,7 @@ def apply_sparse_ffn(
             "selected": selected,
             "total": total,
             "selected_frac": (selected / total) if total else 1.0,
+            "reused": total - selected if fallback_delta is not None else 0,
         }
     return out
 

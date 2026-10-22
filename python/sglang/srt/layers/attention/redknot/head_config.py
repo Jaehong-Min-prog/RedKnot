@@ -105,6 +105,10 @@ class HeadClassConfig:
     dense_prefix_layers:
         If > 0, the first N layers are forced to ``dense`` regardless of the
         configured types. This is a safety knob for tiny models.
+    dense_suffix_layers:
+        If > 0, the final N layers are also forced to ``dense``.  Qwen3 uses
+        this together with ``dense_prefix_layers=3`` to make the 3/59/2
+        RedKnot layer contract explicit and fail-closed.
     """
 
     def __init__(
@@ -118,6 +122,7 @@ class HeadClassConfig:
         local_default_window: int = DEFAULT_LOCAL_WINDOW,
         retrieval_top_p: float = DEFAULT_RETRIEVAL_TOP_P,
         dense_prefix_layers: int = 0,
+        dense_suffix_layers: int = 0,
     ) -> None:
         assert len(head_class) == num_layers, (
             f"head_class layers={len(head_class)} != num_layers={num_layers}"
@@ -134,6 +139,14 @@ class HeadClassConfig:
         self.local_default_window = local_default_window
         self.retrieval_top_p = float(retrieval_top_p)
         self.dense_prefix_layers = int(dense_prefix_layers)
+        self.dense_suffix_layers = int(dense_suffix_layers)
+
+        if not 0 <= self.dense_prefix_layers <= self.num_layers:
+            raise ValueError("dense_prefix_layers is outside the model")
+        if not 0 <= self.dense_suffix_layers <= self.num_layers:
+            raise ValueError("dense_suffix_layers is outside the model")
+        if self.dense_prefix_layers + self.dense_suffix_layers > self.num_layers:
+            raise ValueError("dense prefix/suffix layers overlap")
 
         self._normalize()
 
@@ -164,6 +177,7 @@ class HeadClassConfig:
             local_default_window=local_default_window,
             retrieval_top_p=float(data.get("retrieval_top_p", DEFAULT_RETRIEVAL_TOP_P)),
             dense_prefix_layers=int(data.get("dense_prefix_layers", 0)),
+            dense_suffix_layers=int(data.get("dense_suffix_layers", 0)),
         )
 
     # ────────────────────────────────────────────────────────────────
@@ -171,7 +185,9 @@ class HeadClassConfig:
     # ────────────────────────────────────────────────────────────────
     def get_strategy(self, layer: int, kv_head: int) -> HeadStrategy:
         # First-N dense override
-        if layer < self.dense_prefix_layers:
+        if layer < self.dense_prefix_layers or layer >= (
+            self.num_layers - self.dense_suffix_layers
+        ):
             ss = self._sink_at(layer, kv_head)
             return HeadStrategy(
                 layer=layer,
@@ -247,13 +263,16 @@ class HeadClassConfig:
         flat = []
         for li in range(self.num_layers):
             for kvh in range(self.num_kv_heads):
-                if li < self.dense_prefix_layers:
+                if li < self.dense_prefix_layers or li >= (
+                    self.num_layers - self.dense_suffix_layers
+                ):
                     flat.append(HEAD_DENSE)
                 else:
                     flat.append(self.head_class[li][kvh])
         c = dict(Counter(flat))
         c["total"] = self.num_layers * self.num_kv_heads
         c["dense_prefix_layers"] = self.dense_prefix_layers
+        c["dense_suffix_layers"] = self.dense_suffix_layers
         return c
 
     # ────────────────────────────────────────────────────────────────

@@ -3542,6 +3542,11 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
+            managed_lifecycle = getattr(
+                self.tp_worker.model_runner, "redknot_shared_kv_lifecycle", None
+            )
+            if managed_lifecycle is not None:
+                managed_lifecycle.assert_idle()
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -3581,6 +3586,12 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        managed_lifecycle = getattr(
+            self.tp_worker.model_runner, "redknot_shared_kv_lifecycle", None
+        )
+        if managed_lifecycle is not None:
+            ret["redknot_managed_kv_stats"] = managed_lifecycle.stats()
 
         if (
             not self.spec_algorithm.is_none()

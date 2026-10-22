@@ -220,6 +220,8 @@ def paged_attention(
     windows=None,
     sinks=None,
     backend="auto",
+    skip_invisible=True,
+    num_splits=None,
 ):
     """Compute attention directly over head pages, returning ``[Hq,Nq,D]``.
 
@@ -235,9 +237,15 @@ def paged_attention(
     No backend gathers, concatenates, or expands KV heads into a dense KV tensor.
     Pools must already use the target position/encoding basis declared by the
     manager's reuse/repair plan: this operator does not relocate RoPE keys.
+    CUDA skips invisible K/V blocks by default. ``skip_invisible=False`` is an
+    A/B control using the same attention policy and original full traversal.
     """
     if backend not in ("auto", "torch", "triton"):
         raise ValueError("backend must be 'auto', 'torch', or 'triton'")
+    if not isinstance(skip_invisible, bool):
+        raise TypeError("skip_invisible must be bool")
+    if num_splits is not None and (type(num_splits) is not int or not 1 <= num_splits <= 128):
+        raise ValueError("num_splits must be an integer in 1..128 or None")
     qpos, win, sink, scale = validate_paged_attention_inputs(
         query, k_pool, v_pool, page_slots, page_lengths, key_positions,
         query_positions=query_positions, num_q_per_kv=num_q_per_kv, scale=scale,
@@ -255,6 +263,7 @@ def paged_attention(
         return triton_paged_attention(
             query, k_pool, v_pool, page_slots, page_lengths, key_positions,
             qpos, win, sink, num_q_per_kv, scale, causal,
+            skip_invisible=skip_invisible, num_splits=num_splits,
         )
     return _torch_paged_attention(
         query, k_pool, v_pool, page_slots, page_lengths, key_positions,

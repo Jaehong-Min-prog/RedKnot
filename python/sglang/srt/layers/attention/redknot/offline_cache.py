@@ -71,6 +71,15 @@ class OfflineSegment:
     recurrent_state:
         Optional causal conv + recurrent state for hybrid models such as
         Qwen3.5.
+    ffn_delta:
+        Optional per-layer FFN residual deltas ``[1, L, hidden]`` captured by
+        Qwen3 offline prefill.  Token-selective online execution recomputes
+        selected rows and reuses these immutable deltas for the remaining
+        rows instead of dropping their MLP contribution.
+    attn_output:
+        Optional per-layer pre-``o_proj`` attention head outputs
+        ``[1, L, num_q_heads * head_dim]``.  Middle-layer local heads can be
+        reused verbatim while online global heads are recomputed and merged.
     """
 
     segment_id: str
@@ -81,6 +90,8 @@ class OfflineSegment:
     nbytes: int
     recurrent_state: Optional[OfflineRecurrentState] = None
     meta: Dict[str, object] = field(default_factory=dict)
+    ffn_delta: Optional[List[torch.Tensor]] = None
+    attn_output: Optional[List[torch.Tensor]] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -215,6 +226,14 @@ class OfflineKVCache:
                 seg.recurrent_state.temporal = seg.recurrent_state.temporal.to(
                     device, non_blocking=True
                 )
+            if seg.ffn_delta is not None:
+                seg.ffn_delta = [
+                    delta.to(device, non_blocking=True) for delta in seg.ffn_delta
+                ]
+            if seg.attn_output is not None:
+                seg.attn_output = [
+                    value.to(device, non_blocking=True) for value in seg.attn_output
+                ]
             if seg.device.type == "cuda" and device.type != "cuda":
                 self._device_bytes -= seg.nbytes
                 self._host_bytes += seg.nbytes
@@ -300,12 +319,20 @@ def recurrent_nbytes(state: Optional[OfflineRecurrentState]) -> int:
     )
 
 
+def ffn_delta_nbytes(delta: Optional[List[torch.Tensor]]) -> int:
+    if delta is None:
+        return 0
+    return sum(t.numel() * t.element_size() for t in delta)
+
+
 def build_offline_segment(
     *,
     segment_id: str,
     token_ids: torch.Tensor,
     kv: List[Tuple[torch.Tensor, torch.Tensor]],
     recurrent_state: Optional[OfflineRecurrentState] = None,
+    ffn_delta: Optional[List[torch.Tensor]] = None,
+    attn_output: Optional[List[torch.Tensor]] = None,
 ) -> OfflineSegment:
     """Construct an :class:`OfflineSegment` from raw materials, deriving
     derived fields (``nbytes``, ``device``)."""
@@ -316,7 +343,12 @@ def build_offline_segment(
     first = next((pair for pair in kv if pair[0] is not None), None)
     assert first is not None, "build_offline_segment: all kv entries are None"
     device = first[0].device
-    nbytes = kv_nbytes(kv) + recurrent_nbytes(recurrent_state)
+    nbytes = (
+        kv_nbytes(kv)
+        + recurrent_nbytes(recurrent_state)
+        + ffn_delta_nbytes(ffn_delta)
+        + ffn_delta_nbytes(attn_output)
+    )
     return OfflineSegment(
         segment_id=segment_id,
         token_ids=token_ids.to("cpu"),
@@ -325,6 +357,8 @@ def build_offline_segment(
         device=device,
         nbytes=nbytes,
         recurrent_state=recurrent_state,
+        ffn_delta=ffn_delta,
+        attn_output=attn_output,
     )
 
 
