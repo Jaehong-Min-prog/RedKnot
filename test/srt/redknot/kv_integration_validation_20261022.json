@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-22",
+  "source_commit": "1f830240096fcaf96d270f49ac22c740cce2a7df",
+  "upstream_base": "7cfd22fd0ffeb872122521cb5de581ac60150783",
+  "scope": "Storage, numerical, lifetime, adapter and scheduler regression tests; no pretrained task-quality or throughput measurement",
+  "environment": {
+    "python": "3.11",
+    "torch": "2.9.1+cu128",
+    "transformers": "4.57.1",
+    "pytest": "8.4.2",
+    "flash-attn": "2.7.3",
+    "triton": "3.5.1"
+  },
+  "cpu": {"passed": 1304, "failed": 0, "skipped_cuda_cases": 72},
+  "cuda_single_device": {"passed": 71, "failed": 0, "skipped": 0},
+  "cuda_two_devices": {"passed": 1, "failed": 0, "skipped": 0},
+  "all_cases_executed_across_runs": 1376
+}

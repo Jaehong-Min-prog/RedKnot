@@ -253,3 +253,22 @@ lineage. They do not prove task accuracy or make arbitrary prompts equivalent.
 The model adapter remains responsible for context compatibility, position
 transforms, head classification, and recovery quality. MLA latents and recurrent
 states require representation-specific adapters.
+
+### Integration regression entry point
+
+The checkpoint-free validation suite is listed in
+`test/srt/redknot/kv_validation_tests.txt`. Run it from the repository root:
+
+```bash
+python test/srt/redknot/run_kv_validation.py --mode cpu --junitxml=/tmp/kv-cpu.xml
+CUDA_VISIBLE_DEVICES=0,1 python test/srt/redknot/run_kv_validation.py \
+  --mode cuda --junitxml=/tmp/kv-cuda.xml
+```
+
+CUDA mode requires two allocated GPUs for the device-isolation case. The runner
+uses the caller's allocation and does not manage other GPU jobs. Model-binding
+tests require Transformers 4.57.1; the tested CUDA stack uses PyTorch 2.9.1 with
+CUDA 12.8, FlashAttention 2.7.3, Triton 3.5.1, and pytest 8.4.2. The integration
+record in `test/srt/redknot/kv_integration_validation_20261022.json` reports 1304
+CPU cases and all 72 CUDA cases executed successfully across separate runs.
+These checks validate implementation contracts, not pretrained accuracy or QPS.
